@@ -1,8 +1,13 @@
 .env
 .env.*
 !.env.example
+
 .venv/
 .idea/
 __pycache__/
 *.py[cod]
 .DS_Store
+
+evaluation/workspaces/
+evaluation/results/*
+!evaluation/results/.gitkeep

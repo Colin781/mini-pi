@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, OpenAI
 from dotenv import load_dotenv
 
+from mini_pi.reporting import AgentRunReport
 from mini_pi.tool_definitions import TOOL_DEFINITIONS
 from mini_pi.tools import ToolError, ToolExecutor
 
@@ -108,33 +110,96 @@ def build_parser() -> argparse.ArgumentParser:
         help="自动同意文件修改和测试命令",
     )
 
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="将运行指标写入指定 JSON 文件",
+    )
+
     return parser
 
+def create_report(*, status: str, exit_code: int, task: str, workspace: Path, model: str, started_at: str,
+                  started_monotonic: float, rounds: int, tool_calls: int, final_answer: str | None = None, error: str | None = None,
+                  ) -> AgentRunReport:
+    return AgentRunReport(
+        schema_version=1,
+        status=status,
+        exit_code=exit_code,
+        task=task,
+        workspace=str(workspace),
+        model=model,
+        started_at=started_at,
+        elapsed_seconds=round(
+            time.monotonic() - started_monotonic,
+            3,
+        ),
+        rounds=rounds,
+        tool_calls=tool_calls,
+        final_answer=final_answer,
+        error=error,
+    )
 
-
-def main() -> int:
-    load_dotenv(Path(__file__).with_name(".env"))
-
-
-    parser = build_parser()
-    args = parser.parse_args()
-
+def run_agent(args: argparse.Namespace) -> AgentRunReport:
     root = args.workspace.resolve()
 
+    started_at = datetime.now(timezone.utc).isoformat()
+    started_monotonic = time.monotonic()
+
     if not root.exists():
-        parser.error(f"工作目录不存在：{root}")
+        return create_report(
+            status="configuration_error",
+            exit_code=2,
+            task=args.task,
+            workspace=root,
+            model=args.model,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            rounds=0,
+            tool_calls=0,
+            error=f"工作目录不存在：{root}",
+        )
 
     if not root.is_dir():
-        parser.error(f"工作目录不是文件夹：{root}")
+        return create_report(
+            status="configuration_error",
+            exit_code=2,
+            task=args.task,
+            workspace=root,
+            model=args.model,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            rounds=0,
+            tool_calls=0,
+            error=f"工作目录不是文件夹：{root}",
+        )
 
     if args.max_steps < 1:
-        parser.error("--max-steps 必须大于 0")
+        return create_report(
+            status="configuration_error",
+            exit_code=2,
+            task=args.task,
+            workspace=root,
+            model=args.model,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            rounds=0,
+            tool_calls=0,
+            error="--max-steps 必须大于 0",
+        )
 
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
-        parser.error(
-            "没有找到 DEEPSEEK_API_KEY。"
-            "请在项目根目录的 .env 文件中设置。"
+        return create_report(
+            status="configuration_error",
+            exit_code=2,
+            task=args.task,
+            workspace=root,
+            model=args.model,
+            started_at=started_at,
+            started_monotonic=started_monotonic,
+            rounds=0,
+            tool_calls=0,
+            error="没有找到 DEEPSEEK_API_KEY",
         )
 
     def confirm_action(description: str) -> bool:
@@ -143,7 +208,10 @@ def main() -> int:
             return True
 
         print(f"\n请求执行：{description}")
-        answer = input("是否允许？输入 y 确认：").strip().lower()
+        answer = input(
+            "是否允许？输入 y 确认："
+        ).strip().lower()
+
         return answer == "y"
 
     executor = ToolExecutor(
@@ -169,7 +237,6 @@ def main() -> int:
     ]
 
     tool_call_count = 0
-    started_at = time.monotonic()
 
     print(f"工作目录：{root}")
     print(f"模型：{args.model}")
@@ -191,35 +258,65 @@ def main() -> int:
                 },
             )
         except APIConnectionError as error:
-            print(f"连接 DeepSeek API 失败：{error}")
-            return 1
-        except APIStatusError as error:
-            print(
-                f"DeepSeek API 返回错误："
-                f"HTTP {error.status_code}，{error.message}"
+            return create_report(
+                status="api_error",
+                exit_code=1,
+                task=args.task,
+                workspace=root,
+                model=args.model,
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                rounds=step,
+                tool_calls=tool_call_count,
+                error=f"连接 DeepSeek API 失败：{error}",
             )
-            return 1
+        except APIStatusError as error:
+            return create_report(
+                status="api_error",
+                exit_code=1,
+                task=args.task,
+                workspace=root,
+                model=args.model,
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                rounds=step,
+                tool_calls=tool_call_count,
+                error=(
+                    f"DeepSeek API 返回 HTTP "
+                    f"{error.status_code}：{error.message}"
+                ),
+            )
 
         message = response.choices[0].message
         tool_calls = message.tool_calls or []
 
-        messages.append(serialize_assistant_message(message))
+        messages.append(
+            serialize_assistant_message(message)
+        )
 
         if not tool_calls:
-            elapsed = time.monotonic() - started_at
+            final_answer = (
+                message.content or "模型没有返回文字"
+            )
 
             print("\n========== Agent 最终回答 ==========")
-            print(message.content or "模型没有返回文字")
+            print(final_answer)
 
             print("\n========== 工作区状态 ==========")
             print(executor.git_diff())
 
-            print("\n========== 运行统计 ==========")
-            print(f"Agent 轮数：{step}")
-            print(f"工具调用次数：{tool_call_count}")
-            print(f"运行耗时：{elapsed:.1f} 秒")
-
-            return 0
+            return create_report(
+                status="completed",
+                exit_code=0,
+                task=args.task,
+                workspace=root,
+                model=args.model,
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                rounds=step,
+                tool_calls=tool_call_count,
+                final_answer=final_answer,
+            )
 
         for call in tool_calls:
             tool_call_count += 1
@@ -228,23 +325,38 @@ def main() -> int:
             print(f"\n调用工具：{tool_name}")
 
             try:
-                arguments = json.loads(call.function.arguments)
+                arguments = json.loads(
+                    call.function.arguments
+                )
 
                 if not isinstance(arguments, dict):
-                    raise ToolError("工具参数必须是 JSON 对象")
+                    raise ToolError(
+                        "工具参数必须是 JSON 对象"
+                    )
 
                 result = executor.execute(
                     name=tool_name,
                     arguments=arguments,
                 )
-
             except json.JSONDecodeError as error:
-                result = f"工具参数不是有效 JSON：{error}"
+                result = (
+                    f"工具参数不是有效 JSON：{error}"
+                )
             except ToolError as error:
                 result = f"工具执行失败：{error}"
             except KeyboardInterrupt:
-                print("\n用户中止了操作")
-                return 130
+                return create_report(
+                    status="cancelled",
+                    exit_code=130,
+                    task=args.task,
+                    workspace=root,
+                    model=args.model,
+                    started_at=started_at,
+                    started_monotonic=started_monotonic,
+                    rounds=step,
+                    tool_calls=tool_call_count,
+                    error="用户中止了操作",
+                )
 
             print_tool_result(result)
 
@@ -256,13 +368,44 @@ def main() -> int:
                 }
             )
 
-    elapsed = time.monotonic() - started_at
+    return create_report(
+        status="max_steps_reached",
+        exit_code=2,
+        task=args.task,
+        workspace=root,
+        model=args.model,
+        started_at=started_at,
+        started_monotonic=started_monotonic,
+        rounds=args.max_steps,
+        tool_calls=tool_call_count,
+        error="已达到最大循环次数",
+    )
 
-    print("\n已达到最大循环次数，任务可能尚未完成。")
-    print(executor.git_diff())
-    print(f"运行耗时：{elapsed:.1f} 秒")
 
-    return 2
+
+def main() -> int:
+    # 必须在创建参数解析器前加载，才能读取 DEEPSEEK_MODEL。
+    load_dotenv(Path(__file__).with_name(".env"))
+
+    parser = build_parser()
+    args = parser.parse_args()
+
+    report = run_agent(args)
+
+    if report.error:
+        print(f"\n错误：{report.error}")
+
+    print("\n========== 运行统计 ==========")
+    print(f"状态：{report.status}")
+    print(f"Agent 轮数：{report.rounds}")
+    print(f"工具调用次数：{report.tool_calls}")
+    print(f"运行耗时：{report.elapsed_seconds:.3f} 秒")
+
+    if args.report:
+        report.write_json(args.report)
+        print(f"报告已写入：{args.report.resolve()}")
+
+    return report.exit_code
 
 
 if __name__ == "__main__":
