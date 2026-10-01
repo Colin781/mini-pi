@@ -144,6 +144,31 @@ class ToolExecutorTest(unittest.TestCase):
                 ["python", "dangerous.py"]
             )
 
+    def test_unittest_command_runs(
+        self,
+    ) -> None:
+        self.write_file(
+            "test_demo.py",
+            "import unittest\n\n"
+            "class DemoTest(unittest.TestCase):\n"
+            "    def test_ok(self):\n"
+            "        self.assertTrue(True)\n",
+        )
+
+        result = self.executor.run_command(
+            [
+                "python",
+                "-m",
+                "unittest",
+                "discover",
+                "-v",
+            ]
+        )
+
+        self.assertIn(
+            "退出码：0",
+            result,
+        )
 
 if __name__ == "__main__":
     unittest.main()

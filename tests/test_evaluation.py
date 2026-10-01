@@ -37,7 +37,7 @@ class EvaluationRunnerTest(unittest.TestCase):
         )
 
         manifest = {
-            "version": 1,
+            "version": 2,
             "cases": [
                 {
                     "id": "demo",
@@ -52,6 +52,10 @@ class EvaluationRunnerTest(unittest.TestCase):
                         "unittest",
                     ],
                     "timeout_seconds": 30,
+                    "command_timeout_seconds": 10,
+                    "max_repairs": 2,
+                    "protected_paths": ["tests"],
+                    "allowed_changed_files": ["app.py"],
                 }
             ],
         }
@@ -162,9 +166,13 @@ class EvaluationRunnerTest(unittest.TestCase):
                 elapsed_seconds=10.0,
                 rounds=2,
                 tool_calls=4,
+                repair_attempts=1,
                 workspace="workspace/first",
                 final_answer="done",
                 agent_error=None,
+                changed_files=["app.py"],
+                protected_violations=[],
+                disallowed_changes=[],
                 agent_stdout_tail="",
                 verification_output="OK",
             ),
@@ -179,9 +187,13 @@ class EvaluationRunnerTest(unittest.TestCase):
                 elapsed_seconds=20.0,
                 rounds=4,
                 tool_calls=8,
+                repair_attempts=3,
                 workspace="workspace/second",
                 final_answer="done",
                 agent_error=None,
+                changed_files=["app.py"],
+                protected_violations=[],
+                disallowed_changes=[],
                 agent_stdout_tail="",
                 verification_output="FAILED",
             ),
@@ -193,25 +205,35 @@ class EvaluationRunnerTest(unittest.TestCase):
             result["total_runs"],
             2,
         )
+
         self.assertEqual(
             result["passed_runs"],
             1,
         )
+
         self.assertEqual(
             result["success_rate"],
             50.0,
         )
+
         self.assertEqual(
             result["average_elapsed_seconds"],
             15.0,
         )
+
         self.assertEqual(
             result["average_rounds"],
             3.0,
         )
+
         self.assertEqual(
             result["average_tool_calls"],
             6.0,
+        )
+
+        self.assertEqual(
+            result["average_repair_attempts"],
+            2.0,
         )
 
 

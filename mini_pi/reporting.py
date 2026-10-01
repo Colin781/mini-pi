@@ -1,5 +1,5 @@
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +16,14 @@ class AgentRunReport:
     elapsed_seconds: float
     rounds: int
     tool_calls: int
-    final_answer: str | None
-    error: str | None
+    repair_attempts: int = 0
+    final_answer: str | None = None
+    error: str | None = None
+    verification: dict[str, Any] | None = None
+    changed_files: list[str] = field(default_factory=list)
+    protected_violations: list[str] = field(default_factory=list)
+    disallowed_changes: list[str] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

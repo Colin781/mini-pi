@@ -22,13 +22,61 @@ class AgentCliTest(unittest.TestCase):
             args.workspace,
             Path("example"),
         )
+
         self.assertEqual(
             args.report,
             Path("result.json"),
         )
+
         self.assertEqual(
             args.task,
             "修复测试",
+        )
+
+    def test_v04_arguments(self) -> None:
+        parser = build_parser()
+
+        args = parser.parse_args(
+            [
+                "--workspace",
+                "example",
+                "--verify-command",
+                (
+                    "python -m unittest "
+                    "discover -s tests -v"
+                ),
+                "--max-repairs",
+                "3",
+                "--protected-path",
+                "tests",
+                "--allowed-change",
+                "calculator.py",
+                "修复测试",
+            ]
+        )
+
+        self.assertEqual(
+            args.verify_command[:3],
+            (
+                "python",
+                "-m",
+                "unittest",
+            ),
+        )
+
+        self.assertEqual(
+            args.max_repairs,
+            3,
+        )
+
+        self.assertEqual(
+            args.protected_path,
+            ["tests"],
+        )
+
+        self.assertEqual(
+            args.allowed_change,
+            ["calculator.py"],
         )
 
 

@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import shutil
 import statistics
@@ -12,9 +11,44 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mini_pi.verification import (
+    display_command,
+    run_verification,
+)
+from mini_pi.workspace_state import (
+    changed_files,
+    disallowed_changes,
+    matching_changes,
+    normalize_rule,
+    snapshot_workspace,
+)
 
-CASE_ID_PATTERN = re.compile(r"^[a-z0-9_-]+$")
+
+CASE_ID_PATTERN = re.compile(
+    r"^[a-z0-9_-]+$"
+)
+
 MAX_CAPTURE_LENGTH = 20_000
+
+
+def validate_string_list(
+    value: Any,
+    field_name: str,
+    case_id: str,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or not all(
+            isinstance(item, str) and item
+            for item in value
+        )
+    ):
+        raise ValueError(
+            f"{case_id} 的 {field_name} "
+            "必须是字符串数组"
+        )
+
+    return tuple(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +59,10 @@ class EvaluationCase:
     template: str
     test_command: tuple[str, ...]
     timeout_seconds: int
+    command_timeout_seconds: int
+    max_repairs: int
+    protected_paths: tuple[str, ...]
+    allowed_changed_files: tuple[str, ...]
 
     @classmethod
     def from_dict(
@@ -40,46 +78,121 @@ class EvaluationCase:
         }
 
         missing = required - value.keys()
+
         if missing:
             raise ValueError(
-                f"评测任务缺少字段：{sorted(missing)}"
+                "评测任务缺少字段："
+                f"{sorted(missing)}"
             )
 
         case_id = value["id"]
+
         if (
             not isinstance(case_id, str)
-            or not CASE_ID_PATTERN.fullmatch(case_id)
+            or not CASE_ID_PATTERN.fullmatch(
+                case_id
+            )
         ):
             raise ValueError(
-                f"非法评测任务 ID：{case_id!r}"
+                f"非法评测任务 ID："
+                f"{case_id!r}"
             )
 
-        command = value["test_command"]
+        test_command = validate_string_list(
+            value["test_command"],
+            "test_command",
+            case_id,
+        )
+
+        if not test_command:
+            raise ValueError(
+                f"{case_id} 的 test_command "
+                "不能为空"
+            )
+
+        timeout = value.get(
+            "timeout_seconds",
+            300,
+        )
+
+        command_timeout = value.get(
+            "command_timeout_seconds",
+            60,
+        )
+
+        max_repairs = value.get(
+            "max_repairs",
+            2,
+        )
+
         if (
-            not isinstance(command, list)
-            or not command
-            or not all(
-                isinstance(part, str) and part
-                for part in command
-            )
+            not isinstance(timeout, int)
+            or timeout < 1
         ):
             raise ValueError(
-                f"{case_id} 的 test_command 必须是非空字符串数组"
+                f"{case_id} 的 timeout_seconds "
+                "必须大于 0"
             )
 
-        timeout = value.get("timeout_seconds", 300)
-        if not isinstance(timeout, int) or timeout < 1:
-            raise ValueError(
-                f"{case_id} 的 timeout_seconds 必须大于 0"
+        if (
+            not isinstance(
+                command_timeout,
+                int,
             )
+            or command_timeout < 1
+        ):
+            raise ValueError(
+                f"{case_id} 的 "
+                "command_timeout_seconds "
+                "必须大于 0"
+            )
+
+        if (
+            not isinstance(max_repairs, int)
+            or max_repairs < 0
+        ):
+            raise ValueError(
+                f"{case_id} 的 max_repairs "
+                "不能小于 0"
+            )
+
+        protected = validate_string_list(
+            value.get(
+                "protected_paths",
+                [],
+            ),
+            "protected_paths",
+            case_id,
+        )
+
+        allowed = validate_string_list(
+            value.get(
+                "allowed_changed_files",
+                [],
+            ),
+            "allowed_changed_files",
+            case_id,
+        )
+
+        for rule in (
+            *protected,
+            *allowed,
+        ):
+            normalize_rule(rule)
 
         return cls(
             case_id=case_id,
             title=str(value["title"]),
             task=str(value["task"]),
             template=str(value["template"]),
-            test_command=tuple(command),
+            test_command=test_command,
             timeout_seconds=timeout,
+            command_timeout_seconds=(
+                command_timeout
+            ),
+            max_repairs=max_repairs,
+            protected_paths=protected,
+            allowed_changed_files=allowed,
         )
 
 
@@ -95,13 +208,19 @@ class EvaluationRecord:
     elapsed_seconds: float
     rounds: int
     tool_calls: int
+    repair_attempts: int
     workspace: str
     final_answer: str | None
     agent_error: str | None
+    changed_files: list[str]
+    protected_violations: list[str]
+    disallowed_changes: list[str]
     agent_stdout_tail: str
     verification_output: str
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(
+        self,
+    ) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -112,51 +231,21 @@ def clip_tail(
     if len(text) <= limit:
         return text
 
-    return "... 前面的输出已截断 ...\n" + text[-limit:]
-
-
-def sanitized_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-
-    sensitive_fragments = (
-        "API_KEY",
-        "PASSWORD",
-        "SECRET",
-        "TOKEN",
+    return (
+        "... 前面的输出已截断 ...\n"
+        + text[-limit:]
     )
-
-    for variable_name in list(environment):
-        upper_name = variable_name.upper()
-
-        if any(
-            fragment in upper_name
-            for fragment in sensitive_fragments
-        ):
-            environment.pop(variable_name, None)
-
-    return environment
-
-
-def normalize_test_command(
-    command: tuple[str, ...],
-) -> list[str]:
-    normalized = list(command)
-
-    if Path(normalized[0]).name in {
-        "python",
-        "python3",
-    }:
-        normalized[0] = sys.executable
-
-    return normalized
 
 
 def summarize(
     records: list[EvaluationRecord],
 ) -> dict[str, Any]:
     total = len(records)
-    passed = sum(record.success for record in records)
-    failed = total - passed
+
+    passed = sum(
+        record.success
+        for record in records
+    )
 
     if total == 0:
         return {
@@ -167,12 +256,13 @@ def summarize(
             "average_elapsed_seconds": 0.0,
             "average_rounds": 0.0,
             "average_tool_calls": 0.0,
+            "average_repair_attempts": 0.0,
         }
 
     return {
         "total_runs": total,
         "passed_runs": passed,
-        "failed_runs": failed,
+        "failed_runs": total - passed,
         "success_rate": round(
             passed / total * 100,
             2,
@@ -198,6 +288,13 @@ def summarize(
             ),
             2,
         ),
+        "average_repair_attempts": round(
+            statistics.mean(
+                record.repair_attempts
+                for record in records
+            ),
+            2,
+        ),
     }
 
 
@@ -206,39 +303,56 @@ class EvaluationRunner:
         self,
         project_root: Path,
     ) -> None:
-        self.project_root = project_root.resolve()
-        self.evaluation_root = (
-            self.project_root / "evaluation"
-        )
-        self.manifest_path = (
-            self.evaluation_root / "cases.json"
-        )
-        self.workspaces_root = (
-            self.evaluation_root / "workspaces"
-        )
-        self.results_root = (
-            self.evaluation_root / "results"
-        )
-        self.agent_path = (
-            self.project_root / "agent.py"
+        self.project_root = (
+            project_root.resolve()
         )
 
-    def load_cases(self) -> list[EvaluationCase]:
+        self.evaluation_root = (
+            self.project_root
+            / "evaluation"
+        )
+
+        self.manifest_path = (
+            self.evaluation_root
+            / "cases.json"
+        )
+
+        self.workspaces_root = (
+            self.evaluation_root
+            / "workspaces"
+        )
+
+        self.results_root = (
+            self.evaluation_root
+            / "results"
+        )
+
+        self.agent_path = (
+            self.project_root
+            / "agent.py"
+        )
+
+    def load_cases(
+        self,
+    ) -> list[EvaluationCase]:
         raw = json.loads(
             self.manifest_path.read_text(
                 encoding="utf-8"
             )
         )
 
-        if raw.get("version") != 1:
+        if raw.get("version") != 2:
             raise ValueError(
-                "不支持的 cases.json 版本"
+                "不支持的 cases.json 版本，"
+                "v0.4 需要 version=2"
             )
 
         values = raw.get("cases")
+
         if not isinstance(values, list):
             raise ValueError(
-                "cases.json 中的 cases 必须是数组"
+                "cases.json 中的 cases "
+                "必须是数组"
             )
 
         cases = [
@@ -247,11 +361,17 @@ class EvaluationRunner:
         ]
 
         identifiers = [
-            case.case_id for case in cases
+            case.case_id
+            for case in cases
         ]
 
-        if len(identifiers) != len(set(identifiers)):
-            raise ValueError("评测任务 ID 不能重复")
+        if (
+            len(identifiers)
+            != len(set(identifiers))
+        ):
+            raise ValueError(
+                "评测任务 ID 不能重复"
+            )
 
         for case in cases:
             self.resolve_template(case)
@@ -263,14 +383,18 @@ class EvaluationRunner:
         case: EvaluationCase,
     ) -> Path:
         template = (
-            self.project_root / case.template
+            self.project_root
+            / case.template
         ).resolve()
 
         try:
-            template.relative_to(self.evaluation_root)
+            template.relative_to(
+                self.evaluation_root
+            )
         except ValueError as error:
             raise ValueError(
-                f"{case.case_id} 的模板超出 evaluation 目录"
+                f"{case.case_id} 的模板"
+                "超出 evaluation 目录"
             ) from error
 
         if not template.is_dir():
@@ -302,7 +426,8 @@ class EvaluationRunner:
 
         if unknown:
             raise ValueError(
-                f"未知评测任务：{', '.join(unknown)}"
+                "未知评测任务："
+                f"{', '.join(unknown)}"
             )
 
         return [
@@ -328,8 +453,10 @@ class EvaluationRunner:
         resolved = workspace.resolve()
 
         try:
-            relative = resolved.relative_to(
-                self.workspaces_root.resolve()
+            relative = (
+                resolved.relative_to(
+                    self.workspaces_root.resolve()
+                )
             )
         except ValueError as error:
             raise ValueError(
@@ -352,21 +479,30 @@ class EvaluationRunner:
         initialize_git: bool = True,
     ) -> Path:
         if attempt < 1:
-            raise ValueError("attempt 必须从 1 开始")
+            raise ValueError(
+                "attempt 必须从 1 开始"
+            )
 
-        template = self.resolve_template(case)
+        template = self.resolve_template(
+            case
+        )
+
         workspace = self.workspace_path(
             case,
             attempt,
         )
 
         self.remove_workspace(workspace)
+
         workspace.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        shutil.copytree(template, workspace)
+        shutil.copytree(
+            template,
+            workspace,
+        )
 
         if initialize_git:
             self.initialize_git_repository(
@@ -380,7 +516,11 @@ class EvaluationRunner:
         workspace: Path,
     ) -> None:
         subprocess.run(
-            ["git", "init", "-q"],
+            [
+                "git",
+                "init",
+                "-q",
+            ],
             cwd=workspace,
             check=True,
             capture_output=True,
@@ -388,15 +528,24 @@ class EvaluationRunner:
         )
 
         files = sorted(
-            str(path.relative_to(workspace))
+            str(
+                path.relative_to(workspace)
+            )
             for path in workspace.rglob("*")
-            if path.is_file()
-            and ".git" not in path.parts
+            if (
+                path.is_file()
+                and ".git" not in path.parts
+            )
         )
 
         if files:
             subprocess.run(
-                ["git", "add", "--", *files],
+                [
+                    "git",
+                    "add",
+                    "--",
+                    *files,
+                ],
                 cwd=workspace,
                 check=True,
                 capture_output=True,
@@ -407,9 +556,15 @@ class EvaluationRunner:
             [
                 "git",
                 "-c",
-                "user.name=Mini Pi Evaluation",
+                (
+                    "user.name="
+                    "Mini Pi Evaluation"
+                ),
                 "-c",
-                "user.email=mini-pi@example.invalid",
+                (
+                    "user.email="
+                    "mini-pi@example.invalid"
+                ),
                 "commit",
                 "-q",
                 "-m",
@@ -421,10 +576,14 @@ class EvaluationRunner:
             text=True,
         )
 
-    def create_result_directory(self) -> Path:
+    def create_result_directory(
+        self,
+    ) -> Path:
         timestamp = datetime.now(
             timezone.utc
-        ).strftime("%Y%m%dT%H%M%SZ")
+        ).strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
 
         suffix = uuid.uuid4().hex[:8]
 
@@ -440,6 +599,55 @@ class EvaluationRunner:
 
         return result_directory
 
+    def build_agent_command(
+        self,
+        *,
+        case: EvaluationCase,
+        workspace: Path,
+        report_path: Path,
+    ) -> list[str]:
+        command = [
+            sys.executable,
+            str(self.agent_path),
+            "--yes",
+            "--workspace",
+            str(workspace),
+            "--report",
+            str(report_path),
+            "--verify-command",
+            display_command(
+                case.test_command
+            ),
+            "--command-timeout",
+            str(
+                case.command_timeout_seconds
+            ),
+            "--max-repairs",
+            str(case.max_repairs),
+        ]
+
+        for path in case.protected_paths:
+            command.extend(
+                [
+                    "--protected-path",
+                    path,
+                ]
+            )
+
+        for path in (
+            case.allowed_changed_files
+        ):
+            command.extend(
+                [
+                    "--allowed-change",
+                    path,
+                ]
+            )
+
+        command.append(case.task)
+
+        return command
+
     def run_case(
         self,
         case: EvaluationCase,
@@ -451,26 +659,30 @@ class EvaluationRunner:
             attempt,
         )
 
-        agent_report_path = (
-            result_directory
-            / f"{case.case_id}_run_{attempt}_agent.json"
+        baseline = snapshot_workspace(
+            workspace
         )
 
-        agent_command = [
-            sys.executable,
-            str(self.agent_path),
-            "--yes",
-            "--workspace",
-            str(workspace),
-            "--report",
-            str(agent_report_path),
-            case.task,
-        ]
+        report_path = (
+            result_directory
+            / (
+                f"{case.case_id}"
+                f"_run_{attempt}_agent.json"
+            )
+        )
+
+        agent_command = (
+            self.build_agent_command(
+                case=case,
+                workspace=workspace,
+                report_path=report_path,
+            )
+        )
 
         started = time.monotonic()
 
         try:
-            agent_process = subprocess.run(
+            process = subprocess.run(
                 agent_command,
                 cwd=self.project_root,
                 capture_output=True,
@@ -479,11 +691,12 @@ class EvaluationRunner:
             )
 
             agent_exit_code = (
-                agent_process.returncode
+                process.returncode
             )
+
             agent_output = (
-                agent_process.stdout
-                + agent_process.stderr
+                process.stdout
+                + process.stderr
             )
         except subprocess.TimeoutExpired as error:
             agent_exit_code = 124
@@ -512,67 +725,59 @@ class EvaluationRunner:
             3,
         )
 
-        if agent_report_path.exists():
+        if report_path.exists():
             agent_report = json.loads(
-                agent_report_path.read_text(
+                report_path.read_text(
                     encoding="utf-8"
                 )
             )
         else:
             agent_report = {
                 "status": "missing_report",
-                "elapsed_seconds": wall_elapsed,
+                "elapsed_seconds": (
+                    wall_elapsed
+                ),
                 "rounds": 0,
                 "tool_calls": 0,
+                "repair_attempts": 0,
                 "final_answer": None,
-                "error": "Agent 未生成运行报告",
+                "error": (
+                    "Agent 未生成运行报告"
+                ),
             }
 
-        verification_command = normalize_test_command(
-            case.test_command
+        current = snapshot_workspace(
+            workspace
         )
 
-        try:
-            verification = subprocess.run(
-                verification_command,
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=sanitized_environment(),
-            )
+        changes = changed_files(
+            baseline,
+            current,
+        )
 
-            verification_exit_code = (
-                verification.returncode
-            )
-            verification_output = (
-                verification.stdout
-                + verification.stderr
-            )
-        except subprocess.TimeoutExpired as error:
-            verification_exit_code = 124
+        protected = matching_changes(
+            changes,
+            case.protected_paths,
+        )
 
-            stdout = error.stdout or ""
-            stderr = error.stderr or ""
+        invalid = disallowed_changes(
+            changes,
+            case.allowed_changed_files,
+        )
 
-            if isinstance(stdout, bytes):
-                stdout = stdout.decode(
-                    errors="replace"
-                )
+        verification = run_verification(
+            root=workspace,
+            command=case.test_command,
+            timeout_seconds=(
+                case.command_timeout_seconds
+            ),
+        )
 
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode(
-                    errors="replace"
-                )
-
-            verification_output = (
-                stdout
-                + stderr
-                + "\n验收测试运行超时"
-            )
-
-        # 成功以独立验收测试为准，而不是以模型自述为准。
-        success = verification_exit_code == 0
+        success = (
+            verification.passed
+            and not protected
+            and not invalid
+        )
 
         return EvaluationRecord(
             case_id=case.case_id,
@@ -587,7 +792,7 @@ class EvaluationRunner:
             ),
             agent_exit_code=agent_exit_code,
             verification_exit_code=(
-                verification_exit_code
+                verification.exit_code
             ),
             elapsed_seconds=float(
                 agent_report.get(
@@ -596,11 +801,20 @@ class EvaluationRunner:
                 )
             ),
             rounds=int(
-                agent_report.get("rounds", 0)
+                agent_report.get(
+                    "rounds",
+                    0,
+                )
             ),
             tool_calls=int(
                 agent_report.get(
                     "tool_calls",
+                    0,
+                )
+            ),
+            repair_attempts=int(
+                agent_report.get(
+                    "repair_attempts",
                     0,
                 )
             ),
@@ -615,11 +829,14 @@ class EvaluationRunner:
             agent_error=agent_report.get(
                 "error"
             ),
+            changed_files=changes,
+            protected_violations=protected,
+            disallowed_changes=invalid,
             agent_stdout_tail=clip_tail(
                 agent_output
             ),
             verification_output=clip_tail(
-                verification_output
+                verification.output
             ),
         )
 
@@ -631,16 +848,19 @@ class EvaluationRunner:
         summary = summarize(records)
 
         json_path = (
-            result_directory / "summary.json"
+            result_directory
+            / "summary.json"
         )
 
         json_path.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
-                    "generated_at": datetime.now(
-                        timezone.utc
-                    ).isoformat(),
+                    "schema_version": 2,
+                    "generated_at": (
+                        datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                    ),
                     "summary": summary,
                     "records": [
                         record.to_dict()
@@ -655,16 +875,29 @@ class EvaluationRunner:
         )
 
         markdown_path = (
-            result_directory / "summary.md"
+            result_directory
+            / "summary.md"
         )
 
-        markdown_lines = [
+        lines = [
             "# Mini Pi Evaluation Report",
             "",
-            f"- 总运行次数：{summary['total_runs']}",
-            f"- 成功次数：{summary['passed_runs']}",
-            f"- 失败次数：{summary['failed_runs']}",
-            f"- 成功率：{summary['success_rate']}%",
+            (
+                "- 总运行次数："
+                f"{summary['total_runs']}"
+            ),
+            (
+                "- 成功次数："
+                f"{summary['passed_runs']}"
+            ),
+            (
+                "- 失败次数："
+                f"{summary['failed_runs']}"
+            ),
+            (
+                "- 成功率："
+                f"{summary['success_rate']}%"
+            ),
             (
                 "- 平均耗时："
                 f"{summary['average_elapsed_seconds']} 秒"
@@ -674,30 +907,43 @@ class EvaluationRunner:
                 f"{summary['average_rounds']}"
             ),
             (
+                "- 平均修复次数："
+                f"{summary['average_repair_attempts']}"
+            ),
+            (
                 "- 平均工具调用次数："
                 f"{summary['average_tool_calls']}"
             ),
             "",
-            "| 任务 | 次数 | 成功 | 耗时 | 轮数 | 工具调用 |",
-            "|---|---:|:---:|---:|---:|---:|",
+            (
+                "| 任务 | 次数 | 成功 | 耗时 "
+                "| 轮数 | 修复 | 工具调用 |"
+            ),
+            (
+                "|---|---:|:---:|---:|---:|"
+                "---:|---:|"
+            ),
         ]
 
         for record in records:
-            success_text = (
-                "PASS" if record.success else "FAIL"
+            state = (
+                "PASS"
+                if record.success
+                else "FAIL"
             )
 
-            markdown_lines.append(
+            lines.append(
                 f"| {record.case_id} "
                 f"| {record.attempt} "
-                f"| {success_text} "
+                f"| {state} "
                 f"| {record.elapsed_seconds:.3f}s "
                 f"| {record.rounds} "
+                f"| {record.repair_attempts} "
                 f"| {record.tool_calls} |"
             )
 
         markdown_path.write_text(
-            "\n".join(markdown_lines) + "\n",
+            "\n".join(lines) + "\n",
             encoding="utf-8",
         )
 

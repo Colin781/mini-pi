@@ -25,6 +25,10 @@ Mini Pi 是一个用于学习 Coding Agent 工作原理的 Python 项目。
 - 人工确认
 - 工具层单元测试
 - 固定验收任务
+- Agent 结束后的强制自动验收
+- 验收失败后的自动修复重试
+- 受保护文件和允许修改范围检查
+- 修复次数、验收结果和事件追踪
 
 ## 安装
 
@@ -85,11 +89,29 @@ python evaluate.py run \
 
 成功与否由评测系统在 Agent 结束后独立运行测试判断，不依赖 Agent 自己声称任务是否完成。
 
+## 自动验证与修复
+
+```bash
+python agent.py \
+  --workspace task_fixture \
+  --verify-command "python -m unittest discover -s tests -v" \
+  --max-repairs 2 \
+  --protected-path tests \
+  --allowed-change calculator.py \
+  "修复 calculator.py 中的 add 函数"
+```
+
+Agent 给出答案后会独立运行 `--verify-command`。如果验收失败，错误输出会被发送回模型，模型可以继续修复，直到测试通过或达到 `--max-repairs`。
+
+`--protected-path` 用于保护测试文件，`--allowed-change` 用于限制本次任务允许修改的文件。两个参数都可以重复使用。
+
 ### 评测指标
 
 - 成功率
 - 平均运行时间
 - 平均 Agent 轮数
 - 平均工具调用次数
+- 平均自动修复次数
 - Agent 退出状态
 - 验收测试退出状态
+- 受保护文件违规和越界修改

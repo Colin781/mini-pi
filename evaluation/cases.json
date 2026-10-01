@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "cases": [
     {
       "id": "task_01_calculator",
@@ -15,7 +15,15 @@
         "tests",
         "-v"
       ],
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "command_timeout_seconds": 60,
+      "max_repairs": 2,
+      "protected_paths": [
+        "tests"
+      ],
+      "allowed_changed_files": [
+        "calculator.py"
+      ]
     },
     {
       "id": "task_02_inventory",
@@ -31,7 +39,15 @@
         "tests",
         "-v"
       ],
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "command_timeout_seconds": 60,
+      "max_repairs": 2,
+      "protected_paths": [
+        "tests"
+      ],
+      "allowed_changed_files": [
+        "inventory.py"
+      ]
     }
   ]
 }

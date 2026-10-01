@@ -137,6 +137,7 @@ def main() -> int:
                     f"{state} | "
                     f"{record.elapsed_seconds:.3f}s | "
                     f"{record.rounds} 轮 | "
+                    f"{record.repair_attempts} 次修复 | "
                     f"{record.tool_calls} 次工具调用"
                 )
 
@@ -160,6 +161,10 @@ def main() -> int:
         print(
             "平均轮数："
             f"{summary['average_rounds']}"
+        )
+        print(
+            "平均修复次数："
+            f"{summary['average_repair_attempts']}"
         )
         print(
             "平均工具调用次数："

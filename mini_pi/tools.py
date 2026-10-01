@@ -1,10 +1,14 @@
 import os
-import shlex
 import subprocess
-import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+from mini_pi.verification import (
+    VerificationError,
+    display_command,
+    normalize_verification_command,
+    run_verification,
+)
 
 
 MAX_FILE_SIZE = 512_000
@@ -317,112 +321,73 @@ class ToolExecutor:
             f"新文本行数：{new.count(chr(10)) + 1}"
         )
 
-    def run_command(self, command: list[str]) -> str:
+    def run_command(
+            self,
+            command: list[str],
+    ) -> str:
         if not isinstance(command, list):
-            raise ToolError("command 必须是字符串数组")
+            raise ToolError(
+                "command 必须是字符串数组"
+            )
 
         if not command:
-            raise ToolError("command 不能为空")
+            raise ToolError(
+                "command 不能为空"
+            )
 
-        if not all(isinstance(part, str) and part for part in command):
-            raise ToolError("command 中的每一项都必须是非空字符串")
-
-        normalized = self.normalize_command(command)
-
-        displayed_command = shlex.join(normalized)
-
-        if not self.confirm(f"运行命令：{displayed_command}"):
-            return "用户拒绝了命令执行"
-
-        environment = self.sanitized_environment()
+        if not all(
+                isinstance(part, str) and part
+                for part in command
+        ):
+            raise ToolError(
+                "command 中的每一项"
+                "都必须是非空字符串"
+            )
 
         try:
-            result = subprocess.run(
-                normalized,
-                cwd=self.root,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                env=environment,
-            )
-        except subprocess.TimeoutExpired as error:
-            partial_stdout = error.stdout or ""
-            partial_stderr = error.stderr or ""
-
-            if isinstance(partial_stdout, bytes):
-                partial_stdout = partial_stdout.decode(
-                    errors="replace"
+            normalized = (
+                self.normalize_command(
+                    command
                 )
-
-            if isinstance(partial_stderr, bytes):
-                partial_stderr = partial_stderr.decode(
-                    errors="replace"
-                )
-
-            output = partial_stdout + partial_stderr
-
-            return (
-                "命令运行超过 60 秒，已停止\n"
-                f"{self.tail(output)}"
             )
+        except VerificationError as error:
+            raise ToolError(
+                str(error)
+            ) from error
 
-        output = result.stdout + result.stderr
+        displayed_command = (
+            display_command(normalized)
+        )
+
+        if not self.confirm(
+                f"运行命令：{displayed_command}"
+        ):
+            return "用户拒绝了命令执行"
+
+        try:
+            result = run_verification(
+                root=self.root,
+                command=command,
+                timeout_seconds=60,
+            )
+        except VerificationError as error:
+            raise ToolError(
+                str(error)
+            ) from error
 
         return (
             f"命令：{displayed_command}\n"
-            f"退出码：{result.returncode}\n"
-            f"{self.tail(output)}"
+            f"退出码：{result.exit_code}\n"
+            f"{self.tail(result.output)}"
         )
 
-    def normalize_command(self, command: list[str]) -> list[str]:
-        executable = Path(command[0]).name
-
-        if executable in {"python", "python3", Path(sys.executable).name}:
-            if len(command) < 3:
-                raise ToolError(
-                    "Python 命令只允许运行 unittest 或 pytest"
-                )
-
-            if command[1] != "-m":
-                raise ToolError(
-                    "Python 命令必须使用 python -m 的形式"
-                )
-
-            if command[2] not in {"unittest", "pytest"}:
-                raise ToolError(
-                    "只允许 python -m unittest 或 python -m pytest"
-                )
-
-            return [sys.executable, *command[1:]]
-
-        if executable == "pytest":
-            return [sys.executable, "-m", "pytest", *command[1:]]
-
-        raise ToolError(
-            "命令不在允许列表中。"
-            "目前只允许 unittest 和 pytest。"
+    def normalize_command(
+            self,
+            command: list[str],
+    ) -> list[str]:
+        return normalize_verification_command(
+            command
         )
-
-    def sanitized_environment(self) -> dict[str, str]:
-        environment = os.environ.copy()
-
-        sensitive_fragments = (
-            "API_KEY",
-            "PASSWORD",
-            "SECRET",
-            "TOKEN",
-        )
-
-        for variable_name in list(environment):
-            upper_name = variable_name.upper()
-
-            if any(
-                fragment in upper_name
-                for fragment in sensitive_fragments
-            ):
-                environment.pop(variable_name, None)
-
-        return environment
 
     def git_diff(self) -> str:
         status = subprocess.run(
