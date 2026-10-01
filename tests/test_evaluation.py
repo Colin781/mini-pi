@@ -37,7 +37,7 @@ class EvaluationRunnerTest(unittest.TestCase):
         )
 
         manifest = {
-            "version": 2,
+            "version": 4,
             "cases": [
                 {
                     "id": "demo",
@@ -54,6 +54,8 @@ class EvaluationRunnerTest(unittest.TestCase):
                     "timeout_seconds": 30,
                     "command_timeout_seconds": 10,
                     "max_repairs": 2,
+                    "max_context_chars": 30000,
+                    "max_file_chars": 10000,
                     "protected_paths": ["tests"],
                     "allowed_changed_files": ["app.py"],
                 }
@@ -167,6 +169,14 @@ class EvaluationRunnerTest(unittest.TestCase):
                 rounds=2,
                 tool_calls=4,
                 repair_attempts=1,
+                files_read=5,
+                unique_files_read=3,
+                context_chars=12000,
+                search_calls=2,
+                patches_applied=1,
+                checkpoints_created=2,
+                checkpoints_restored=0,
+                trace_path="first.jsonl",
                 workspace="workspace/first",
                 final_answer="done",
                 agent_error=None,
@@ -188,6 +198,14 @@ class EvaluationRunnerTest(unittest.TestCase):
                 rounds=4,
                 tool_calls=8,
                 repair_attempts=3,
+                files_read=9,
+                unique_files_read=5,
+                context_chars=18000,
+                search_calls=4,
+                patches_applied=3,
+                checkpoints_created=4,
+                checkpoints_restored=2,
+                trace_path="second.jsonl",
                 workspace="workspace/second",
                 final_answer="done",
                 agent_error=None,
@@ -235,6 +253,13 @@ class EvaluationRunnerTest(unittest.TestCase):
             result["average_repair_attempts"],
             2.0,
         )
+
+        self.assertEqual(result["average_files_read"], 7.0)
+        self.assertEqual(result["average_unique_files_read"], 4.0)
+        self.assertEqual(result["average_context_chars"], 15000.0)
+        self.assertEqual(result["average_search_calls"], 3.0)
+        self.assertEqual(result["average_patches_applied"], 2.0)
+        self.assertEqual(result["average_checkpoints_restored"], 1.0)
 
 
 if __name__ == "__main__":

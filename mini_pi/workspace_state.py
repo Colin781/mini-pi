@@ -7,6 +7,7 @@ IGNORED_DIRECTORIES = {
     ".git",
     ".idea",
     ".mypy_cache",
+    ".mini-pi",
     ".pytest_cache",
     ".ruff_cache",
     ".venv",

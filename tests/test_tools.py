@@ -54,6 +54,26 @@ class ToolExecutorTest(unittest.TestCase):
 
         self.assertIn("message.txt:1", result)
 
+    def test_repository_summary_and_symbol_tools(self) -> None:
+        self.write_file(
+            "service.py",
+            "def calculate_total(value):\n"
+            "    return value * 2\n",
+        )
+        self.write_file(
+            "app.py",
+            "from service import calculate_total\n"
+            "calculate_total(3)\n",
+        )
+
+        summary = self.executor.repository_summary()
+        symbols = self.executor.find_symbol("calculate_total")
+        references = self.executor.find_references("calculate_total")
+
+        self.assertIn("Repository summary", summary)
+        self.assertIn("service.py:1-2", symbols)
+        self.assertIn("app.py:1", references)
+
     def test_read_file_with_line_range(self) -> None:
         self.write_file(
             "numbers.txt",
@@ -88,6 +108,26 @@ class ToolExecutorTest(unittest.TestCase):
             "return a + b",
             path.read_text(encoding="utf-8"),
         )
+
+    def test_apply_patch_tool(self) -> None:
+        path = self.write_file(
+            "calculator.py",
+            "def add(a, b):\n"
+            "    return a - b\n",
+        )
+
+        result = self.executor.apply_patch(
+            "--- a/calculator.py\n"
+            "+++ b/calculator.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def add(a, b):\n"
+            "-    return a - b\n"
+            "+    return a + b\n"
+        )
+
+        self.assertIn("补丁已应用", result)
+        self.assertIn("return a + b", path.read_text(encoding="utf-8"))
+        self.assertEqual(self.executor.stats.patches_applied, 1)
 
     def test_replace_requires_unique_text(self) -> None:
         self.write_file(

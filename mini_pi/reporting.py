@@ -17,6 +17,14 @@ class AgentRunReport:
     rounds: int
     tool_calls: int
     repair_attempts: int = 0
+    files_read: int = 0
+    unique_files_read: int = 0
+    context_chars: int = 0
+    search_calls: int = 0
+    patches_applied: int = 0
+    checkpoints_created: int = 0
+    checkpoints_restored: int = 0
+    trace_path: str | None = None
     final_answer: str | None = None
     error: str | None = None
     verification: dict[str, Any] | None = None

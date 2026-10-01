@@ -2,6 +2,21 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "repository_summary",
+            "description": (
+                "重新扫描代码库并返回项目类型、文件树、"
+                "测试目录、配置、Git 状态和关键 Python 符号。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
             "name": "list_files",
             "description": (
                 "列出工作目录或指定子目录中的文件。"
@@ -54,6 +69,55 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "find_symbol",
+            "description": (
+                "使用 Python AST 查找函数、异步函数、方法或类的定义，"
+                "返回文件路径和精确行号。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "符号名或限定名，例如 run_agent",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "最大结果数量，默认 50",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "find_references",
+            "description": (
+                "使用 Python AST 查找符号的名称引用、属性访问和导入关系。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "需要查找引用的符号名",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "最大结果数量，默认 50",
+                    },
+                },
+                "required": ["name"],
             },
         },
     },
@@ -119,6 +183,65 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "apply_patch",
+            "description": (
+                "事务式应用 unified diff。所有 hunk 必须与当前文件上下文匹配，"
+                "任何冲突都会拒绝整个补丁且不修改文件。优先使用此工具修改代码。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": (
+                            "完整 unified diff，包含 ---、+++ 和 @@ 行"
+                        ),
+                    }
+                },
+                "required": ["patch"],
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "create_checkpoint",
+            "description": "复制当前工作区文件并创建可恢复的检查点。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": "string",
+                        "description": "检查点标签，默认 manual",
+                    }
+                },
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
+            "name": "restore_checkpoint",
+            "description": (
+                "恢复指定检查点；省略 ID 时恢复最近的检查点。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "checkpoint_id": {
+                        "type": "string",
+                        "description": "create_checkpoint 返回的检查点 ID",
+                    }
+                },
+            },
+        },
+    },
+
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": (
                 "在工作目录中运行受限制的测试命令。"
@@ -138,7 +261,11 @@ TOOL_DEFINITIONS = [
                             '["python", "-m", "unittest", '
                             '"discover", "-s", "tests", "-v"]'
                         ),
-                    }
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "命令超时秒数，默认 60",
+                    },
                 },
                 "required": ["command"],
             },

@@ -3,6 +3,7 @@ import json
 import os
 import shlex
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,13 @@ from typing import Any
 from openai import APIConnectionError, APIStatusError, OpenAI
 from dotenv import load_dotenv
 
+from mini_pi.context import ContextLimits, ContextManager
+from mini_pi.checkpoints import CheckpointManager
+from mini_pi.protection import DEFAULT_PROTECTED_PATHS
 from mini_pi.reporting import AgentRunReport
 from mini_pi.tool_definitions import TOOL_DEFINITIONS
 from mini_pi.tools import ToolError, ToolExecutor
+from mini_pi.tracing import JsonlTraceWriter, NullTraceWriter
 
 from mini_pi.verification import (
     VerificationError,
@@ -42,12 +47,16 @@ SYSTEM_PROMPT = """
 6. 向用户说明修改内容和测试结果。
 
 工作规则：
-- 不要猜测文件路径。
-- 如果不知道项目结构，先调用 list_files。
-- 如果需要定位函数、类或文本，调用 search_text。
+- 开始时先阅读自动提供的 Repository summary，不要盲目遍历整个仓库。
+- 定位 Python 函数或类时优先调用 find_symbol。
+- 分析调用方和导入关系时调用 find_references。
+- 只有符号搜索不足时再使用 search_text 或 list_files。
 - 修改文件前先调用 read_file 阅读相关代码。
+- 大文件只读取相关行范围，不要重复读取整个文件。
 - 在修改前尽量先运行测试，确认问题存在。
-- 修改代码时调用 replace_text。
+- 修改代码时优先调用 apply_patch，提交包含上下文的 unified diff。
+- 补丁冲突后重新读取相关行，不要绕过冲突或修改受保护文件。
+- create_checkpoint 和 restore_checkpoint 可用于手动保存或恢复工作区。
 - 一次只做必要的最小修改。
 - 修改完成后必须运行测试。
 - 完成前调用 git_diff 查看最终变更。
@@ -133,6 +142,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--max-context-chars",
+        type=int,
+        default=30_000,
+        help="单轮代码上下文字符预算，默认 30000",
+    )
+
+    parser.add_argument(
+        "--max-file-chars",
+        type=int,
+        default=10_000,
+        help="单个文件读取字符上限，默认 10000",
+    )
+
+    parser.add_argument(
         "--max-repairs",
         type=int,
         default=2,
@@ -194,6 +217,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="将运行指标写入指定 JSON 文件",
     )
 
+    parser.add_argument(
+        "--trace",
+        type=Path,
+        help="将完整运行轨迹写入 JSONL 文件",
+    )
+
     return parser
 
 def create_report(
@@ -207,6 +236,14 @@ def create_report(
     rounds: int,
     tool_calls: int,
     repair_attempts: int = 0,
+    files_read: int = 0,
+    unique_files_read: int = 0,
+    context_chars: int = 0,
+    search_calls: int = 0,
+    patches_applied: int = 0,
+    checkpoints_created: int = 0,
+    checkpoints_restored: int = 0,
+    trace_path: str | None = None,
     final_answer: str | None = None,
     error: str | None = None,
     verification: VerificationResult | None = None,
@@ -216,7 +253,7 @@ def create_report(
     events: list[dict[str, Any]] | None = None,
 ) -> AgentRunReport:
     return AgentRunReport(
-        schema_version=2,
+        schema_version=4,
         status=status,
         exit_code=exit_code,
         task=args.task,
@@ -230,6 +267,14 @@ def create_report(
         rounds=rounds,
         tool_calls=tool_calls,
         repair_attempts=repair_attempts,
+        files_read=files_read,
+        unique_files_read=unique_files_read,
+        context_chars=context_chars,
+        search_calls=search_calls,
+        patches_applied=patches_applied,
+        checkpoints_created=checkpoints_created,
+        checkpoints_restored=checkpoints_restored,
+        trace_path=trace_path,
         final_answer=final_answer,
         error=error,
         verification=(
@@ -279,10 +324,40 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
     started_monotonic = time.monotonic()
 
     events: list[dict[str, Any]] = []
+    trace: JsonlTraceWriter | NullTraceWriter = NullTraceWriter()
+
+    if args.trace:
+        try:
+            trace = JsonlTraceWriter(args.trace)
+        except OSError as error:
+            return create_report(
+                status="configuration_error",
+                exit_code=2,
+                args=args,
+                workspace=root,
+                started_at=started_at,
+                started_monotonic=started_monotonic,
+                rounds=0,
+                tool_calls=0,
+                error=f"无法创建 JSONL 轨迹：{error}",
+            )
+
+    trace.write(
+        "run_started",
+        task=args.task,
+        workspace=str(root),
+        model=args.model,
+    )
 
     def configuration_error(
         message: str,
     ) -> AgentRunReport:
+        trace.write(
+            "run_finished",
+            status="configuration_error",
+            exit_code=2,
+            error=message,
+        )
         return create_report(
             status="configuration_error",
             exit_code=2,
@@ -295,6 +370,11 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             rounds=0,
             tool_calls=0,
             error=message,
+            trace_path=(
+                str(trace.path)
+                if trace.path
+                else None
+            ),
             events=events,
         )
 
@@ -324,9 +404,22 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
         )
 
     try:
+        context_limits = ContextLimits(
+            max_context_chars=args.max_context_chars,
+            max_file_chars=args.max_file_chars,
+        )
+    except ValueError as error:
+        return configuration_error(str(error))
+
+    try:
         protected_rules = tuple(
-            normalize_rule(rule)
-            for rule in args.protected_path
+            dict.fromkeys(
+                normalize_rule(rule)
+                for rule in (
+                    *DEFAULT_PROTECTED_PATHS,
+                    *args.protected_path,
+                )
+            )
         )
 
         allowed_rules = tuple(
@@ -370,9 +463,21 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
     def confirm_action(
         description: str,
     ) -> bool:
+        trace.write(
+            "approval_requested",
+            description=description,
+            automatic=args.yes,
+        )
+
         if args.yes:
             print(
                 f"\n自动批准：{description}"
+            )
+            trace.write(
+                "approval_resolved",
+                description=description,
+                approved=True,
+                automatic=True,
             )
             return True
 
@@ -380,7 +485,7 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             f"\n请求执行：{description}"
         )
 
-        return (
+        approved = (
             input(
                 "是否允许？输入 y 确认："
             )
@@ -389,9 +494,90 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             == "y"
         )
 
+        trace.write(
+            "approval_resolved",
+            description=description,
+            approved=approved,
+            automatic=False,
+        )
+        return approved
+
+    def confirm_sensitive_action(
+        description: str,
+    ) -> bool:
+        trace.write(
+            "approval_requested",
+            description=description,
+            automatic=False,
+            sensitive=True,
+        )
+
+        if args.yes:
+            print(
+                "\n自动运行模式拒绝需要人工确认的操作："
+                f"{description}"
+            )
+            trace.write(
+                "approval_resolved",
+                description=description,
+                approved=False,
+                automatic=True,
+                sensitive=True,
+            )
+            return False
+
+        print(f"\n高风险操作：{description}")
+        approved = (
+            input("是否允许？输入 y 确认：")
+            .strip()
+            .lower()
+            == "y"
+        )
+        trace.write(
+            "approval_resolved",
+            description=description,
+            approved=approved,
+            automatic=False,
+            sensitive=True,
+        )
+        return approved
+
+    checkpoint_manager = CheckpointManager(root)
+
     executor = ToolExecutor(
         root=root,
         confirm=confirm_action,
+        confirm_sensitive=confirm_sensitive_action,
+        protected_paths=protected_rules,
+        checkpoint_manager=checkpoint_manager,
+        trace=trace,
+    )
+
+    executor.create_checkpoint("initial_attempt")
+    active_checkpoint_id = (
+        checkpoint_manager.latest().checkpoint_id
+    )
+
+    context = ContextManager(
+        task=args.task,
+        repository_files=[
+            item.path
+            for item in executor.repository.files
+        ],
+        limits=context_limits,
+    )
+
+    repository_summary = executor.repository.summary(
+        max_chars=min(
+            10_000,
+            args.max_context_chars // 2,
+        )
+    )
+    context.register_summary(repository_summary)
+    trace.write(
+        "repository_summarized",
+        summary=repository_summary,
+        context_chars=len(repository_summary),
     )
 
     messages: list[dict[str, Any]] = [
@@ -401,7 +587,10 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
         },
         {
             "role": "user",
-            "content": args.task,
+            "content": (
+                f"{args.task}\n\n"
+                f"{repository_summary}"
+            ),
         },
     ]
 
@@ -449,6 +638,25 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
 
         return changes, protected, invalid
 
+    def restore_active_checkpoint(reason: str) -> str | None:
+        try:
+            executor.restore_checkpoint(active_checkpoint_id)
+        except ToolError as error:
+            trace.write(
+                "checkpoint_restore_failed",
+                checkpoint_id=active_checkpoint_id,
+                reason=reason,
+                error=str(error),
+            )
+            return str(error)
+
+        trace.write(
+            "attempt_rolled_back",
+            checkpoint_id=active_checkpoint_id,
+            reason=reason,
+        )
+        return None
+
     def finish(
         *,
         status: str,
@@ -461,7 +669,7 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             invalid,
         ) = workspace_result()
 
-        return create_report(
+        report = create_report(
             status=status,
             exit_code=exit_code,
             args=args,
@@ -473,6 +681,20 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             rounds=rounds,
             tool_calls=tool_call_count,
             repair_attempts=repair_attempts,
+            files_read=context.metrics.files_read,
+            unique_files_read=len(
+                context.metrics.unique_files
+            ),
+            context_chars=context.metrics.context_chars,
+            search_calls=context.metrics.search_calls,
+            patches_applied=executor.stats.patches_applied,
+            checkpoints_created=executor.stats.checkpoints_created,
+            checkpoints_restored=executor.stats.checkpoints_restored,
+            trace_path=(
+                str(trace.path)
+                if trace.path
+                else None
+            ),
             final_answer=final_answer,
             error=error,
             verification=last_verification,
@@ -481,6 +703,21 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             invalid_changes=invalid,
             events=events,
         )
+
+        trace.write(
+            "run_finished",
+            status=status,
+            exit_code=exit_code,
+            rounds=rounds,
+            tool_calls=tool_call_count,
+            repair_attempts=repair_attempts,
+            patches_applied=executor.stats.patches_applied,
+            checkpoints_created=executor.stats.checkpoints_created,
+            checkpoints_restored=executor.stats.checkpoints_restored,
+            error=error,
+        )
+        checkpoint_manager.cleanup()
+        return report
 
     for step in range(
         1,
@@ -492,6 +729,12 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             f"\n========== 第 {step} 轮 =========="
         )
 
+        model_started = time.monotonic()
+        trace.write(
+            "model_started",
+            round=step,
+        )
+
         try:
             response = (
                 client
@@ -499,7 +742,7 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                 .completions
                 .create(
                     model=args.model,
-                    messages=messages,
+                    messages=context.prepare_messages(messages),
                     tools=TOOL_DEFINITIONS,
                     tool_choice="auto",
                     extra_body={
@@ -509,7 +752,31 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                     },
                 )
             )
+        except KeyboardInterrupt:
+            trace.write(
+                "model_failed",
+                round=step,
+                duration_ms=round(
+                    (time.monotonic() - model_started) * 1000
+                ),
+                error="用户中止了模型请求",
+            )
+            restore_active_checkpoint("user_cancelled")
+            return finish(
+                status="cancelled",
+                exit_code=130,
+                error="用户中止了操作",
+            )
         except APIConnectionError as error:
+            trace.write(
+                "model_failed",
+                round=step,
+                duration_ms=round(
+                    (time.monotonic() - model_started) * 1000
+                ),
+                error=str(error),
+            )
+            restore_active_checkpoint("api_connection_error")
             return finish(
                 status="api_error",
                 exit_code=1,
@@ -519,6 +786,15 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                 ),
             )
         except APIStatusError as error:
+            trace.write(
+                "model_failed",
+                round=step,
+                duration_ms=round(
+                    (time.monotonic() - model_started) * 1000
+                ),
+                error=str(error),
+            )
+            restore_active_checkpoint("api_status_error")
             return finish(
                 status="api_error",
                 exit_code=1,
@@ -535,6 +811,16 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
 
         tool_calls = (
             message.tool_calls or []
+        )
+
+        trace.write(
+            "model_finished",
+            round=step,
+            duration_ms=round(
+                (time.monotonic() - model_started) * 1000
+            ),
+            tool_call_count=len(tool_calls),
+            message=serialize_assistant_message(message),
         )
 
         messages.append(
@@ -565,6 +851,13 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                     f"\n调用工具：{tool_name}"
                 )
 
+                tool_started = time.monotonic()
+                trace.write(
+                    "tool_started",
+                    round=step,
+                    tool=tool_name,
+                )
+
                 try:
                     arguments = json.loads(
                         call.function.arguments
@@ -578,9 +871,22 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                             "工具参数必须是 JSON 对象"
                         )
 
+                    trace.write(
+                        "tool_arguments",
+                        round=step,
+                        tool=tool_name,
+                        arguments=arguments,
+                    )
+
                     result = executor.execute(
                         name=tool_name,
                         arguments=arguments,
+                    )
+
+                    result = context.observe_tool_result(
+                        name=tool_name,
+                        arguments=arguments,
+                        result=result,
                     )
 
                     event_status = (
@@ -599,6 +905,16 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                     )
                     event_status = "error"
                 except KeyboardInterrupt:
+                    trace.write(
+                        "tool_finished",
+                        round=step,
+                        tool=tool_name,
+                        status="cancelled",
+                        duration_ms=round(
+                            (time.monotonic() - tool_started) * 1000
+                        ),
+                    )
+                    restore_active_checkpoint("user_cancelled")
                     return finish(
                         status="cancelled",
                         exit_code=130,
@@ -612,6 +928,18 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                         "tool": tool_name,
                         "status": event_status,
                     }
+                )
+
+                trace.write(
+                    "tool_finished",
+                    round=step,
+                    tool=tool_name,
+                    status=event_status,
+                    duration_ms=round(
+                        (time.monotonic() - tool_started) * 1000
+                    ),
+                    result_chars=len(result),
+                    result=result,
                 )
 
                 print_tool_result(result)
@@ -666,6 +994,14 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                 }
             )
 
+            trace.write(
+                "policy_violation",
+                round=step,
+                protected_files=protected,
+                disallowed_files=invalid,
+            )
+            restore_active_checkpoint("policy_violation")
+
             return finish(
                 status="invalid_solution",
                 exit_code=1,
@@ -683,6 +1019,12 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                 exit_code=0,
             )
 
+        trace.write(
+            "verification_started",
+            round=step,
+            command=list(args.verify_command),
+        )
+
         last_verification = (
             run_verification(
                 root=root,
@@ -693,6 +1035,10 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                     args.command_timeout
                 ),
             )
+        )
+
+        context.observe_diagnostics(
+            last_verification.output
         )
 
         events.append(
@@ -712,6 +1058,21 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                     .elapsed_seconds
                 ),
             }
+        )
+
+        trace.write(
+            (
+                "verification_passed"
+                if last_verification.passed
+                else "verification_failed"
+            ),
+            round=step,
+            exit_code=last_verification.exit_code,
+            timed_out=last_verification.timed_out,
+            duration_ms=round(
+                last_verification.elapsed_seconds * 1000
+            ),
+            output=last_verification.output,
         )
 
         print(
@@ -742,6 +1103,9 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             repair_attempts
             >= args.max_repairs
         ):
+            restore_active_checkpoint(
+                "maximum_repair_attempts_reached"
+            )
             return finish(
                 status=(
                     "verification_failed"
@@ -755,6 +1119,13 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
 
         repair_attempts += 1
 
+        executor.create_checkpoint(
+            f"repair_{repair_attempts}_start"
+        )
+        active_checkpoint_id = (
+            checkpoint_manager.latest().checkpoint_id
+        )
+
         events.append(
             {
                 "type": "repair_started",
@@ -763,6 +1134,13 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                     repair_attempts
                 ),
             }
+        )
+
+        trace.write(
+            "repair_started",
+            round=step,
+            attempt=repair_attempts,
+            checkpoint_id=active_checkpoint_id,
         )
 
         messages.append(
@@ -790,6 +1168,14 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
     ) = workspace_result()
 
     if protected or invalid:
+        trace.write(
+            "policy_violation",
+            round=rounds,
+            protected_files=protected,
+            disallowed_files=invalid,
+            reason="max_steps_reached",
+        )
+        restore_active_checkpoint("policy_violation_at_max_steps")
         return finish(
             status="invalid_solution",
             exit_code=1,
@@ -800,6 +1186,13 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
         )
 
     if args.verify_command:
+        trace.write(
+            "verification_started",
+            round=rounds,
+            command=list(args.verify_command),
+            reason="max_steps_reached",
+        )
+
         last_verification = (
             run_verification(
                 root=root,
@@ -810,6 +1203,10 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
                     args.command_timeout
                 ),
             )
+        )
+
+        context.observe_diagnostics(
+            last_verification.output
         )
 
         events.append(
@@ -834,12 +1231,29 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             }
         )
 
+        trace.write(
+            (
+                "verification_passed"
+                if last_verification.passed
+                else "verification_failed"
+            ),
+            round=rounds,
+            exit_code=last_verification.exit_code,
+            timed_out=last_verification.timed_out,
+            duration_ms=round(
+                last_verification.elapsed_seconds * 1000
+            ),
+            reason="max_steps_reached",
+            output=last_verification.output,
+        )
+
         if last_verification.passed:
             return finish(
                 status="success",
                 exit_code=0,
             )
 
+    restore_active_checkpoint("max_steps_reached")
     return finish(
         status="max_steps_reached",
         exit_code=2,
@@ -854,6 +1268,19 @@ def main() -> int:
 
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.trace is None:
+        if args.report:
+            args.trace = args.report.with_suffix(
+                ".trace.jsonl"
+            )
+        else:
+            args.trace = (
+                Path.home()
+                / ".mini-pi"
+                / "traces"
+                / f"{uuid.uuid4().hex}.jsonl"
+            )
 
     report = run_agent(args)
 
@@ -875,6 +1302,15 @@ def main() -> int:
         f"工具调用次数："
         f"{report.tool_calls}"
     )
+    print(f"读取文件次数：{report.files_read}")
+    print(f"读取文件数：{report.unique_files_read}")
+    print(f"上下文字符数：{report.context_chars}")
+    print(f"搜索调用次数：{report.search_calls}")
+    print(f"应用补丁次数：{report.patches_applied}")
+    print(f"创建检查点次数：{report.checkpoints_created}")
+    print(f"恢复检查点次数：{report.checkpoints_restored}")
+    if report.trace_path:
+        print(f"运行轨迹：{report.trace_path}")
     print(
         f"运行耗时："
         f"{report.elapsed_seconds:.3f} 秒"

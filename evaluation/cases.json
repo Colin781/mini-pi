@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 4,
   "cases": [
     {
       "id": "task_01_calculator",
@@ -18,8 +18,11 @@
       "timeout_seconds": 300,
       "command_timeout_seconds": 60,
       "max_repairs": 2,
+      "max_context_chars": 30000,
+      "max_file_chars": 10000,
       "protected_paths": [
-        "tests"
+        "tests",
+        "evaluation"
       ],
       "allowed_changed_files": [
         "calculator.py"
@@ -42,11 +45,42 @@
       "timeout_seconds": 300,
       "command_timeout_seconds": 60,
       "max_repairs": 2,
+      "max_context_chars": 30000,
+      "max_file_chars": 10000,
       "protected_paths": [
-        "tests"
+        "tests",
+        "evaluation"
       ],
       "allowed_changed_files": [
         "inventory.py"
+      ]
+    },
+    {
+      "id": "task_03_large_repo",
+      "title": "在大型仓库中修复订单总额",
+      "task": "高级会员订单总额计算错误。请定位相关定义和引用，修复折扣金额以及税费计算顺序；折扣应在计税前扣除。不要修改测试。",
+      "template": "evaluation/templates/task_03_large_repo",
+      "test_command": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "timeout_seconds": 300,
+      "command_timeout_seconds": 60,
+      "max_repairs": 2,
+      "max_context_chars": 30000,
+      "max_file_chars": 10000,
+      "protected_paths": [
+        "tests",
+        "evaluation"
+      ],
+      "allowed_changed_files": [
+        "store/pricing.py",
+        "store/orders.py"
       ]
     }
   ]

@@ -4,6 +4,7 @@
 
 .venv/
 .idea/
+.mini-pi/
 __pycache__/
 *.py[cod]
 .DS_Store

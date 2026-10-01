@@ -1,13 +1,28 @@
 import os
-import subprocess
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+import subprocess
 from pathlib import Path
 from typing import Any
+from mini_pi.checkpoints import CheckpointError, CheckpointManager
+from mini_pi.command_policy import (
+    CommandPolicyError,
+    SafeCommandRunner,
+)
+from mini_pi.patching import (
+    PatchError,
+    apply_unified_diff,
+    parse_unified_diff,
+)
+from mini_pi.protection import (
+    DEFAULT_PROTECTED_PATHS,
+    PathProtector,
+    ProtectedPathError,
+)
+from mini_pi.repository import RepositoryIndex
+from mini_pi.tracing import NullTraceWriter
 from mini_pi.verification import (
-    VerificationError,
     display_command,
-    normalize_verification_command,
-    run_verification,
 )
 
 
@@ -19,6 +34,7 @@ IGNORED_DIRECTORIES = {
     ".git",
     ".idea",
     ".mypy_cache",
+    ".mini-pi",
     ".pytest_cache",
     ".ruff_cache",
     ".venv",
@@ -37,14 +53,40 @@ class ToolError(Exception):
 ConfirmCallback = Callable[[str], bool]
 
 
+@dataclass(slots=True)
+class ToolStats:
+    patches_applied: int = 0
+    checkpoints_created: int = 0
+    checkpoints_restored: int = 0
+
+
 class ToolExecutor:
     def __init__(
         self,
         root: Path,
         confirm: ConfirmCallback,
+        confirm_sensitive: ConfirmCallback | None = None,
+        protected_paths: tuple[str, ...] = DEFAULT_PROTECTED_PATHS,
+        checkpoint_manager: CheckpointManager | None = None,
+        trace: Any | None = None,
     ) -> None:
         self.root = root.resolve()
         self.confirm = confirm
+        self.repository = RepositoryIndex(self.root)
+        self.protector = PathProtector.from_rules(protected_paths)
+        self._checkpoint_manager = checkpoint_manager
+        self.trace = trace or NullTraceWriter()
+        self.command_runner = SafeCommandRunner(
+            root=self.root,
+            confirm=confirm_sensitive or self.confirm,
+        )
+        self.stats = ToolStats()
+
+    @property
+    def checkpoint_manager(self) -> CheckpointManager:
+        if self._checkpoint_manager is None:
+            self._checkpoint_manager = CheckpointManager(self.root)
+        return self._checkpoint_manager
 
     def execute(
         self,
@@ -52,10 +94,16 @@ class ToolExecutor:
         arguments: dict[str, Any],
     ) -> str:
         handlers = {
+            "repository_summary": self.repository_summary,
             "list_files": self.list_files,
             "search_text": self.search_text,
+            "find_symbol": self.find_symbol,
+            "find_references": self.find_references,
             "read_file": self.read_file,
             "replace_text": self.replace_text,
+            "apply_patch": self.apply_patch,
+            "create_checkpoint": self.create_checkpoint,
+            "restore_checkpoint": self.restore_checkpoint,
             "run_command": self.run_command,
             "git_diff": self.git_diff,
         }
@@ -140,6 +188,55 @@ class ToolExecutor:
 
     def relative_name(self, path: Path) -> str:
         return str(path.relative_to(self.root))
+
+    def repository_summary(self) -> str:
+        self.repository.refresh()
+        return self.repository.summary()
+
+    def find_symbol(
+        self,
+        name: str,
+        max_results: int = 50,
+    ) -> str:
+        if not isinstance(name, str) or not name.strip():
+            raise ToolError("符号名称不能为空")
+        if not isinstance(max_results, int):
+            raise ToolError("max_results 必须是整数")
+
+        maximum = max(1, min(max_results, 200))
+        self.repository.refresh()
+        matches = self.repository.find_symbols(name, maximum)
+
+        if not matches:
+            return f"没有找到符号：{name}"
+
+        return "\n".join(
+            f"{item.path}:{item.line}-{item.end_line}: "
+            f"{item.kind} {item.qualified_name}"
+            for item in matches
+        )
+
+    def find_references(
+        self,
+        name: str,
+        max_results: int = 50,
+    ) -> str:
+        if not isinstance(name, str) or not name.strip():
+            raise ToolError("符号名称不能为空")
+        if not isinstance(max_results, int):
+            raise ToolError("max_results 必须是整数")
+
+        maximum = max(1, min(max_results, 200))
+        self.repository.refresh()
+        matches = self.repository.find_references(name, maximum)
+
+        if not matches:
+            return f"没有找到引用：{name}"
+
+        return "\n".join(
+            f"{item.path}:{item.line}: {item.kind}: {item.code}"
+            for item in matches
+        )
 
     def list_files(self, path: str = ".") -> str:
         base = self.resolve_path(path)
@@ -278,6 +375,12 @@ class ToolExecutor:
         new: str,
     ) -> str:
         file_path = self.resolve_path(path)
+        relative = self.relative_name(file_path)
+
+        try:
+            self.protector.ensure_writable(relative)
+        except ProtectedPathError as error:
+            raise ToolError(str(error)) from error
 
         if not file_path.is_file():
             raise ToolError(f"不是文件：{path}")
@@ -314,6 +417,7 @@ class ToolExecutor:
 
         updated = content.replace(old, new, 1)
         file_path.write_text(updated, encoding="utf-8")
+        self.repository.refresh()
 
         return (
             f"已修改：{path}\n"
@@ -321,63 +425,107 @@ class ToolExecutor:
             f"新文本行数：{new.count(chr(10)) + 1}"
         )
 
+    def apply_patch(self, patch: str) -> str:
+        try:
+            parsed = parse_unified_diff(patch)
+            paths = [item.new_path for item in parsed]
+
+            for path in paths:
+                self.protector.ensure_writable(path)
+        except (PatchError, ProtectedPathError) as error:
+            raise ToolError(str(error)) from error
+
+        description = (
+            "应用统一 diff，修改文件："
+            + ", ".join(paths)
+        )
+
+        if not self.confirm(description):
+            return "用户拒绝了补丁修改"
+
+        try:
+            result = apply_unified_diff(
+                root=self.root,
+                diff_text=patch,
+                protector=self.protector,
+            )
+        except PatchError as error:
+            raise ToolError(str(error)) from error
+
+        self.repository.refresh()
+        self.stats.patches_applied += 1
+        self.trace.write(
+            "patch_applied",
+            files=list(result.changed_files),
+            patch_sha256=result.patch_sha256,
+            added_lines=result.added_lines,
+            removed_lines=result.removed_lines,
+        )
+
+        return (
+            "补丁已应用\n"
+            f"文件：{', '.join(result.changed_files)}\n"
+            f"新增行：{result.added_lines}\n"
+            f"删除行：{result.removed_lines}\n"
+            f"SHA-256：{result.patch_sha256}"
+        )
+
+    def create_checkpoint(self, label: str = "manual") -> str:
+        checkpoint = self.checkpoint_manager.create(label)
+        self.stats.checkpoints_created += 1
+        self.trace.write(
+            "checkpoint_created",
+            checkpoint_id=checkpoint.checkpoint_id,
+            label=checkpoint.label,
+            file_count=len(checkpoint.files),
+        )
+        return (
+            f"检查点已创建：{checkpoint.checkpoint_id}\n"
+            f"标签：{checkpoint.label}\n"
+            f"文件数：{len(checkpoint.files)}"
+        )
+
+    def restore_checkpoint(
+        self,
+        checkpoint_id: str | None = None,
+    ) -> str:
+        try:
+            checkpoint = self.checkpoint_manager.restore(checkpoint_id)
+        except CheckpointError as error:
+            raise ToolError(str(error)) from error
+
+        self.repository.refresh()
+        self.stats.checkpoints_restored += 1
+        self.trace.write(
+            "checkpoint_restored",
+            checkpoint_id=checkpoint.checkpoint_id,
+            label=checkpoint.label,
+        )
+        return (
+            f"已恢复检查点：{checkpoint.checkpoint_id}\n"
+            f"标签：{checkpoint.label}"
+        )
+
     def run_command(
             self,
             command: list[str],
+            timeout_seconds: int = 60,
     ) -> str:
-        if not isinstance(command, list):
-            raise ToolError(
-                "command 必须是字符串数组"
-            )
-
-        if not command:
-            raise ToolError(
-                "command 不能为空"
-            )
-
-        if not all(
-                isinstance(part, str) and part
-                for part in command
-        ):
-            raise ToolError(
-                "command 中的每一项"
-                "都必须是非空字符串"
-            )
-
         try:
-            normalized = (
-                self.normalize_command(
-                    command
-                )
+            result = self.command_runner.run(
+                command,
+                timeout_seconds=timeout_seconds,
             )
-        except VerificationError as error:
-            raise ToolError(
-                str(error)
-            ) from error
-
-        displayed_command = (
-            display_command(normalized)
-        )
-
-        if not self.confirm(
-                f"运行命令：{displayed_command}"
-        ):
-            return "用户拒绝了命令执行"
-
-        try:
-            result = run_verification(
-                root=self.root,
-                command=command,
-                timeout_seconds=60,
-            )
-        except VerificationError as error:
+        except CommandPolicyError as error:
             raise ToolError(
                 str(error)
             ) from error
 
         return (
-            f"命令：{displayed_command}\n"
+            f"命令：{display_command(result.command)}\n"
+            f"策略：{result.decision.value}\n"
             f"退出码：{result.exit_code}\n"
+            f"超时：{'是' if result.timed_out else '否'}\n"
             f"{self.tail(result.output)}"
         )
 
@@ -385,8 +533,11 @@ class ToolExecutor:
             self,
             command: list[str],
     ) -> list[str]:
-        return normalize_verification_command(
-            command
+        assessment = self.command_runner.policy.assess(command)
+        if assessment.decision.value == "deny":
+            raise ToolError(assessment.reason)
+        return self.command_runner.policy.executable_command(
+            assessment.command
         )
 
     def git_diff(self) -> str:

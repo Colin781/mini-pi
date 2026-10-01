@@ -47,6 +47,10 @@ class AgentCliTest(unittest.TestCase):
                 ),
                 "--max-repairs",
                 "3",
+                "--max-context-chars",
+                "24000",
+                "--max-file-chars",
+                "8000",
                 "--protected-path",
                 "tests",
                 "--allowed-change",
@@ -68,6 +72,9 @@ class AgentCliTest(unittest.TestCase):
             args.max_repairs,
             3,
         )
+
+        self.assertEqual(args.max_context_chars, 24000)
+        self.assertEqual(args.max_file_chars, 8000)
 
         self.assertEqual(
             args.protected_path,

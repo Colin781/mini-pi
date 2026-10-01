@@ -61,6 +61,8 @@ class EvaluationCase:
     timeout_seconds: int
     command_timeout_seconds: int
     max_repairs: int
+    max_context_chars: int
+    max_file_chars: int
     protected_paths: tuple[str, ...]
     allowed_changed_files: tuple[str, ...]
 
@@ -125,6 +127,16 @@ class EvaluationCase:
             2,
         )
 
+        max_context_chars = value.get(
+            "max_context_chars",
+            30_000,
+        )
+
+        max_file_chars = value.get(
+            "max_file_chars",
+            10_000,
+        )
+
         if (
             not isinstance(timeout, int)
             or timeout < 1
@@ -154,6 +166,25 @@ class EvaluationCase:
             raise ValueError(
                 f"{case_id} 的 max_repairs "
                 "不能小于 0"
+            )
+
+        if (
+            not isinstance(max_context_chars, int)
+            or max_context_chars < 1_000
+        ):
+            raise ValueError(
+                f"{case_id} 的 max_context_chars "
+                "不能小于 1000"
+            )
+
+        if (
+            not isinstance(max_file_chars, int)
+            or max_file_chars < 500
+            or max_file_chars > max_context_chars
+        ):
+            raise ValueError(
+                f"{case_id} 的 max_file_chars "
+                "必须介于 500 和 max_context_chars 之间"
             )
 
         protected = validate_string_list(
@@ -191,6 +222,8 @@ class EvaluationCase:
                 command_timeout
             ),
             max_repairs=max_repairs,
+            max_context_chars=max_context_chars,
+            max_file_chars=max_file_chars,
             protected_paths=protected,
             allowed_changed_files=allowed,
         )
@@ -209,6 +242,14 @@ class EvaluationRecord:
     rounds: int
     tool_calls: int
     repair_attempts: int
+    files_read: int
+    unique_files_read: int
+    context_chars: int
+    search_calls: int
+    patches_applied: int
+    checkpoints_created: int
+    checkpoints_restored: int
+    trace_path: str | None
     workspace: str
     final_answer: str | None
     agent_error: str | None
@@ -257,6 +298,12 @@ def summarize(
             "average_rounds": 0.0,
             "average_tool_calls": 0.0,
             "average_repair_attempts": 0.0,
+            "average_files_read": 0.0,
+            "average_unique_files_read": 0.0,
+            "average_context_chars": 0.0,
+            "average_search_calls": 0.0,
+            "average_patches_applied": 0.0,
+            "average_checkpoints_restored": 0.0,
         }
 
     return {
@@ -291,6 +338,33 @@ def summarize(
         "average_repair_attempts": round(
             statistics.mean(
                 record.repair_attempts
+                for record in records
+            ),
+            2,
+        ),
+        "average_files_read": round(
+            statistics.mean(record.files_read for record in records),
+            2,
+        ),
+        "average_unique_files_read": round(
+            statistics.mean(record.unique_files_read for record in records),
+            2,
+        ),
+        "average_context_chars": round(
+            statistics.mean(record.context_chars for record in records),
+            2,
+        ),
+        "average_search_calls": round(
+            statistics.mean(record.search_calls for record in records),
+            2,
+        ),
+        "average_patches_applied": round(
+            statistics.mean(record.patches_applied for record in records),
+            2,
+        ),
+        "average_checkpoints_restored": round(
+            statistics.mean(
+                record.checkpoints_restored
                 for record in records
             ),
             2,
@@ -341,10 +415,10 @@ class EvaluationRunner:
             )
         )
 
-        if raw.get("version") != 2:
+        if raw.get("version") != 4:
             raise ValueError(
                 "不支持的 cases.json 版本，"
-                "v0.4 需要 version=2"
+                "v0.6 需要 version=4"
             )
 
         values = raw.get("cases")
@@ -624,6 +698,10 @@ class EvaluationRunner:
             ),
             "--max-repairs",
             str(case.max_repairs),
+            "--max-context-chars",
+            str(case.max_context_chars),
+            "--max-file-chars",
+            str(case.max_file_chars),
         ]
 
         for path in case.protected_paths:
@@ -740,6 +818,14 @@ class EvaluationRunner:
                 "rounds": 0,
                 "tool_calls": 0,
                 "repair_attempts": 0,
+                "files_read": 0,
+                "unique_files_read": 0,
+                "context_chars": 0,
+                "search_calls": 0,
+                "patches_applied": 0,
+                "checkpoints_created": 0,
+                "checkpoints_restored": 0,
+                "trace_path": None,
                 "final_answer": None,
                 "error": (
                     "Agent 未生成运行报告"
@@ -818,6 +904,22 @@ class EvaluationRunner:
                     0,
                 )
             ),
+            files_read=int(agent_report.get("files_read", 0)),
+            unique_files_read=int(
+                agent_report.get("unique_files_read", 0)
+            ),
+            context_chars=int(agent_report.get("context_chars", 0)),
+            search_calls=int(agent_report.get("search_calls", 0)),
+            patches_applied=int(
+                agent_report.get("patches_applied", 0)
+            ),
+            checkpoints_created=int(
+                agent_report.get("checkpoints_created", 0)
+            ),
+            checkpoints_restored=int(
+                agent_report.get("checkpoints_restored", 0)
+            ),
+            trace_path=agent_report.get("trace_path"),
             workspace=str(
                 workspace.relative_to(
                     self.project_root
@@ -855,7 +957,7 @@ class EvaluationRunner:
         json_path.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 4,
                     "generated_at": (
                         datetime.now(
                             timezone.utc
@@ -914,14 +1016,34 @@ class EvaluationRunner:
                 "- 平均工具调用次数："
                 f"{summary['average_tool_calls']}"
             ),
+            (
+                "- 平均读取文件数："
+                f"{summary['average_unique_files_read']}"
+            ),
+            (
+                "- 平均上下文字符数："
+                f"{summary['average_context_chars']}"
+            ),
+            (
+                "- 平均搜索次数："
+                f"{summary['average_search_calls']}"
+            ),
+            (
+                "- 平均补丁次数："
+                f"{summary['average_patches_applied']}"
+            ),
+            (
+                "- 平均回滚次数："
+                f"{summary['average_checkpoints_restored']}"
+            ),
             "",
             (
                 "| 任务 | 次数 | 成功 | 耗时 "
-                "| 轮数 | 修复 | 工具调用 |"
+                "| 轮数 | 修复 | 工具调用 | 文件 | 上下文 | 搜索 |"
             ),
             (
                 "|---|---:|:---:|---:|---:|"
-                "---:|---:|"
+                "---:|---:|---:|---:|---:|"
             ),
         ]
 
@@ -939,7 +1061,10 @@ class EvaluationRunner:
                 f"| {record.elapsed_seconds:.3f}s "
                 f"| {record.rounds} "
                 f"| {record.repair_attempts} "
-                f"| {record.tool_calls} |"
+                f"| {record.tool_calls} "
+                f"| {record.unique_files_read} "
+                f"| {record.context_chars} "
+                f"| {record.search_calls} |"
             )
 
         markdown_path.write_text(

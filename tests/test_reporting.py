@@ -22,7 +22,7 @@ class AgentRunReportTest(
             )
 
             report = AgentRunReport(
-                schema_version=2,
+                schema_version=4,
                 status="success",
                 exit_code=0,
                 task="修复测试",
@@ -36,6 +36,14 @@ class AgentRunReportTest(
                 rounds=3,
                 tool_calls=6,
                 repair_attempts=1,
+                files_read=6,
+                unique_files_read=4,
+                context_chars=18240,
+                search_calls=3,
+                patches_applied=2,
+                checkpoints_created=3,
+                checkpoints_restored=1,
+                trace_path="/tmp/run.jsonl",
                 final_answer="测试通过",
                 error=None,
                 verification={
@@ -78,6 +86,14 @@ class AgentRunReportTest(
                 ],
                 1,
             )
+
+            self.assertEqual(saved["files_read"], 6)
+            self.assertEqual(saved["unique_files_read"], 4)
+            self.assertEqual(saved["context_chars"], 18240)
+            self.assertEqual(saved["search_calls"], 3)
+            self.assertEqual(saved["patches_applied"], 2)
+            self.assertEqual(saved["checkpoints_restored"], 1)
+            self.assertEqual(saved["trace_path"], "/tmp/run.jsonl")
 
             self.assertTrue(
                 saved["verification"][

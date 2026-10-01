@@ -138,7 +138,11 @@ def main() -> int:
                     f"{record.elapsed_seconds:.3f}s | "
                     f"{record.rounds} 轮 | "
                     f"{record.repair_attempts} 次修复 | "
-                    f"{record.tool_calls} 次工具调用"
+                    f"{record.tool_calls} 次工具调用 | "
+                    f"{record.unique_files_read} 个文件 | "
+                    f"{record.context_chars} 上下文字符 | "
+                    f"{record.patches_applied} 次补丁 | "
+                    f"{record.checkpoints_restored} 次回滚"
                 )
 
         json_path, markdown_path = (
@@ -169,6 +173,26 @@ def main() -> int:
         print(
             "平均工具调用次数："
             f"{summary['average_tool_calls']}"
+        )
+        print(
+            "平均读取文件数："
+            f"{summary['average_unique_files_read']}"
+        )
+        print(
+            "平均上下文字符数："
+            f"{summary['average_context_chars']}"
+        )
+        print(
+            "平均搜索次数："
+            f"{summary['average_search_calls']}"
+        )
+        print(
+            "平均补丁次数："
+            f"{summary['average_patches_applied']}"
+        )
+        print(
+            "平均回滚次数："
+            f"{summary['average_checkpoints_restored']}"
         )
         print(f"JSON 报告：{json_path}")
         print(f"Markdown 报告：{markdown_path}")
