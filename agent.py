@@ -314,7 +314,12 @@ def repair_prompt(
         f"{diff}"
     )
 
-def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentRunReport:
+def run_agent(
+    args: argparse.Namespace,
+    *,
+    client: Any | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> AgentRunReport:
     root = args.workspace.resolve()
 
     started_at = datetime.now(
@@ -584,15 +589,32 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
         {
             "role": "system",
             "content": SYSTEM_PROMPT,
-        },
+        }
+    ]
+
+    for history_message in conversation_history or []:
+        role = history_message.get("role")
+        content = history_message.get("content")
+        if role not in {"user", "assistant"}:
+            continue
+        if not isinstance(content, str) or not content.strip():
+            continue
+        messages.append(
+            {
+                "role": role,
+                "content": content,
+            }
+        )
+
+    messages.append(
         {
             "role": "user",
             "content": (
                 f"{args.task}\n\n"
                 f"{repository_summary}"
             ),
-        },
-    ]
+        }
+    )
 
     tool_call_count = 0
     repair_attempts = 0
@@ -1009,10 +1031,11 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
             )
 
         if not args.verify_command:
-            print(
-                "\n========== 工作区状态 =========="
-            )
-            print(executor.git_diff())
+            if getattr(args, "show_diff", True):
+                print(
+                    "\n========== 工作区状态 =========="
+                )
+                print(executor.git_diff())
 
             return finish(
                 status="completed",
@@ -1089,10 +1112,11 @@ def run_agent(args: argparse.Namespace, *, client: Any | None = None,) -> AgentR
         )
 
         if last_verification.passed:
-            print(
-                "\n========== 工作区状态 =========="
-            )
-            print(executor.git_diff())
+            if getattr(args, "show_diff", True):
+                print(
+                    "\n========== 工作区状态 =========="
+                )
+                print(executor.git_diff())
 
             return finish(
                 status="success",

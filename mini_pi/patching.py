@@ -177,9 +177,9 @@ def parse_unified_diff(diff_text: str) -> tuple[FilePatch, ...]:
         if not hunks:
             raise PatchError(f"文件补丁没有 hunk：{new_path}")
         if new_path == "/dev/null":
-            raise PatchError("v0.6 暂不允许通过补丁删除文件")
+            raise PatchError("当前版本暂不允许通过补丁删除文件")
         if old_path != "/dev/null" and old_path != new_path:
-            raise PatchError("v0.6 暂不支持文件重命名")
+            raise PatchError("当前版本暂不支持文件重命名")
 
         patches.append(FilePatch(old_path, new_path, tuple(hunks)))
 

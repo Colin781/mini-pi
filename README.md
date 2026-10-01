@@ -38,6 +38,10 @@ Mini Pi 是一个用于学习 Coding Agent 工作原理的 Python 项目。
 - 自动允许、需要确认和拒绝三级命令策略
 - 默认关键文件保护
 - 可完整复盘的 JSONL 运行轨迹
+- 持续对话的交互式 REPL
+- 会话内上下文复用、任务历史和一键撤销
+- 普通对话与代码任务自动分流
+- 可安装的 `mini-pi` 全局命令
 
 ## 安装
 
@@ -45,6 +49,98 @@ Mini Pi 是一个用于学习 Coding Agent 工作原理的 Python 项目。
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+将密钥写入项目根目录的 `.env`，或者写入
+`~/.config/mini-pi/.env`：
+
+```dotenv
+DEEPSEEK_API_KEY=你的真实密钥
+DEEPSEEK_MODEL=deepseek-flash
+```
+
+## 交互式 REPL
+
+安装后，在需要处理的代码仓库中运行：
+
+```bash
+cd /path/to/your/project
+mini-pi
+```
+
+也可以在其他目录中指定工作区：
+
+```bash
+mini-pi --workspace /path/to/your/project
+```
+
+尚未安装命令行入口时，可以在 Mini Pi 源码目录中运行：
+
+```bash
+python -m mini_pi --workspace /path/to/your/project
+```
+
+进入 REPL 后可以连续输入任务。成功任务的用户请求和 Agent
+回答会作为后续任务的对话上下文，工作区修改也会持续保留：
+
+```text
+mini-pi> 找到订单总额计算错误并修复
+mini-pi> 继续补充对空订单的处理
+mini-pi> /diff
+mini-pi> /undo
+```
+
+默认的 `auto` 模式会先判断输入类型。问候、概念解释等普通问题使用
+不带代码工具的轻量对话流程；修复、修改、测试以及包含仓库文件路径的请求
+使用完整 Agent 流程。轻量对话不会扫描仓库、创建检查点或打印 Git diff。
+
+自动判断不符合预期时，可以明确指定本次输入：
+
+```text
+mini-pi> /chat Python 的装饰器是什么？
+mini-pi> /agent 修复 calculator.py 中的 add 函数
+mini-pi> /mode agent
+mini-pi> /mode auto
+```
+
+从 IDE 或终端粘贴 `file:` 文件地址时，REPL 会把地址转换成相对路径，
+并自动选择文件所在的子项目作为本次 Agent 工作区。例如：
+
+```text
+mini-pi> file:/path/repository/packages/calculator/tests/test_calculator.py，修复测试发现的问题
+```
+
+如果这是 `unittest` 测试文件，REPL 会从子项目目录运行测试，并把对应测试
+目录加入本次任务的保护列表。这样测试中的本地模块可以正常导入，Agent 也不会
+为了修复导入路径而修改验收测试。工作区外的 `file:` 地址会被直接拒绝。
+
+常用命令：
+
+- `/help`：显示全部命令
+- `/status`：查看工作区、模型、验收命令和最近运行状态
+- `/mode auto|chat|agent`：切换后续输入的处理模式
+- `/chat 内容`：只进行普通对话，不启用代码工具
+- `/agent 任务`：强制使用完整 Coding Agent 流程
+- `/model deepseek-chat`：在当前会话切换模型
+- `/verify python -m unittest discover -s tests -v`：设置自动验收
+- `/history`：显示本次会话已完成的任务
+- `/diff`：显示当前 Git diff
+- `/undo`：撤销上一个成功任务的文件修改和对话记录
+- `/new`：清空对话记录并从当前工作区开始新会话
+- `/trace`：显示最近一次 JSONL 轨迹路径
+- `/exit`：退出
+
+完整 Git diff 只在执行 `/diff` 时显示，Agent 任务完成后只输出回答和简短运行统计。
+
+输入内容以反斜杠结尾时，可以继续输入下一行。终端输入历史默认保存在
+`~/.mini-pi/history`，每次任务的 JSON 报告和 JSONL 轨迹保存在当前工作区的
+`.mini-pi/runs/`。该目录已被 Git 忽略。
+
+不进入 REPL 时仍可执行单次任务：
+
+```bash
+mini-pi --workspace . "修复订单总额计算并运行测试"
 ```
 
 ## 可复现评测

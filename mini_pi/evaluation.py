@@ -418,7 +418,7 @@ class EvaluationRunner:
         if raw.get("version") != 4:
             raise ValueError(
                 "不支持的 cases.json 版本，"
-                "v0.6 需要 version=4"
+                "当前版本需要 version=4"
             )
 
         values = raw.get("cases")
