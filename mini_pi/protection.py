@@ -6,6 +6,7 @@ from mini_pi.workspace_state import matches_rule, normalize_rule
 DEFAULT_PROTECTED_PATHS = (
     ".git",
     ".env",
+    ".mini-pi",
 )
 
 EVALUATION_PROTECTED_PATHS = (
@@ -13,6 +14,7 @@ EVALUATION_PROTECTED_PATHS = (
     "evaluation",
     ".git",
     ".env",
+    ".mini-pi",
 )
 
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import subprocess
 from pathlib import Path
 from typing import Any
+from mini_pi.change_tracking import ChangeTracker
 from mini_pi.checkpoints import CheckpointError, CheckpointManager
 from mini_pi.command_policy import (
     CommandPolicyError,
@@ -81,6 +82,7 @@ class ToolExecutor:
             confirm=confirm_sensitive or self.confirm,
         )
         self.stats = ToolStats()
+        self.change_tracker = ChangeTracker()
 
     @property
     def checkpoint_manager(self) -> CheckpointManager:
@@ -417,6 +419,12 @@ class ToolExecutor:
 
         updated = content.replace(old, new, 1)
         file_path.write_text(updated, encoding="utf-8")
+        self.change_tracker.record_replacement(
+            relative,
+            content,
+            old,
+            new,
+        )
         self.repository.refresh()
 
         return (
@@ -453,6 +461,7 @@ class ToolExecutor:
             raise ToolError(str(error)) from error
 
         self.repository.refresh()
+        self.change_tracker.record_patch(patch)
         self.stats.patches_applied += 1
         self.trace.write(
             "patch_applied",
@@ -495,6 +504,7 @@ class ToolExecutor:
             raise ToolError(str(error)) from error
 
         self.repository.refresh()
+        self.change_tracker.clear()
         self.stats.checkpoints_restored += 1
         self.trace.write(
             "checkpoint_restored",
@@ -540,9 +550,15 @@ class ToolExecutor:
             assessment.command
         )
 
-    def git_diff(self) -> str:
+    def git_diff(self, path: str | None = None) -> str:
+        relative: str | None = None
+        if path:
+            target = self.resolve_path(path, must_exist=False)
+            relative = self.relative_name(target)
+        pathspec = ["--", relative] if relative else ["--", "."]
+
         status = subprocess.run(
-            ["git", "status", "--short", "--", "."],
+            ["git", "status", "--short", *pathspec],
             cwd=self.root,
             capture_output=True,
             text=True,
@@ -557,13 +573,7 @@ class ToolExecutor:
             )
 
         diff = subprocess.run(
-            [
-                "git",
-                "diff",
-                "--no-ext-diff",
-                "--",
-                ".",
-            ],
+            ["git", "diff", "--no-ext-diff", *pathspec],
             cwd=self.root,
             capture_output=True,
             text=True,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shlex
 import sys
@@ -16,8 +17,12 @@ from agent import run_agent
 from mini_pi import __version__
 from mini_pi.chat import ChatResult, run_chat
 from mini_pi.checkpoints import CheckpointError, CheckpointManager
+from mini_pi.config import AppConfig
+from mini_pi.conversation import build_conversation_window
 from mini_pi.reporting import AgentRunReport
+from mini_pi.sessions import SessionError, SessionMetadata, SessionStore
 from mini_pi.task_scope import TaskScope, TaskScopeError, plan_task_scope
+from mini_pi.terminal_ui import TerminalUI
 from mini_pi.tools import ToolError, ToolExecutor
 from mini_pi.verification import VerificationError, normalize_verification_command
 
@@ -54,14 +59,21 @@ HELP_TEXT = """可用命令：
   /help                  显示帮助
   /status                显示当前会话状态
   /history               显示本次会话的任务
+  /sessions              列出已保存会话
+  /resume ID             恢复指定会话
+  /rename 名称           重命名当前会话
+  /compact               压缩较早的对话上下文
+  /context               显示当前上下文使用情况
+  /config                显示合并后的有效配置
   /mode [auto|chat|agent] 查看或切换输入模式
   /chat [内容]           强制普通对话；无内容时切换到 chat 模式
   /agent [任务]          强制代码任务；无内容时切换到 agent 模式
   /model [名称]          查看或切换模型
   /verify [命令|off]     查看、设置或关闭自动验收命令
-  /diff                  显示当前 Git diff
+  /changes               显示最近任务修改的位置
+  /diff [文件|序号]      显示全部或单个文件的 Git diff
   /undo                  撤销上一个成功任务的工作区修改
-  /new                   清空对话历史并开始新会话
+  /new [名称]            创建并切换到新会话
   /clear                 清屏
   /trace                 显示最近一次运行轨迹
   /exit 或 /quit         退出
@@ -93,6 +105,10 @@ class ReplConfig:
     conversation_chars: int = 12_000
     history_file: Path | None = None
     mode: str = "auto"
+    verbosity: str = "normal"
+    session_store: SessionStore | None = None
+    session_id: str | None = None
+    app_config: AppConfig | None = None
 
     def __post_init__(self) -> None:
         self.workspace = self.workspace.expanduser().resolve()
@@ -102,6 +118,8 @@ class ReplConfig:
             raise ValueError("conversation_chars 不能小于 1000")
         if self.mode not in {"auto", "chat", "agent"}:
             raise ValueError("mode 必须是 auto、chat 或 agent")
+        if self.verbosity not in {"quiet", "normal", "verbose"}:
+            raise ValueError("verbosity 必须是 quiet、normal 或 verbose")
 
 
 @dataclass(slots=True)
@@ -172,9 +190,14 @@ class InteractiveRepl:
     ) -> None:
         self.config = config
         self.writer = writer
+        self.ui = TerminalUI(writer)
         self.agent_runner = agent_runner
         self.chat_runner = chat_runner
         self.terminal_input: TerminalInput | None = None
+        self.session_store = config.session_store
+        self.session: SessionMetadata | None = None
+        self.conversation_summary = ""
+        self.summarized_message_count = 0
 
         if reader is None:
             self.terminal_input = TerminalInput(config.history_file)
@@ -183,6 +206,11 @@ class InteractiveRepl:
             self.reader = reader
 
         self.history: list[dict[str, str]] = []
+        if self.session_store is not None:
+            if config.session_id:
+                self._load_session(config.session_id)
+            else:
+                self._create_session()
         self.turns: list[ReplTurn] = []
         self.last_report: AgentRunReport | None = None
         self.checkpoints = CheckpointManager(config.workspace)
@@ -194,9 +222,17 @@ class InteractiveRepl:
             self.close()
             return 2
 
-        self.writer(f"Mini Pi v{__version__}")
-        self.writer(f"工作目录：{self.config.workspace}")
-        self.writer("输入 /help 查看命令，Ctrl+D 退出。")
+        self.ui.welcome(
+            version=f"v{__version__}",
+            workspace=self.config.workspace,
+            model=self.config.model,
+            mode=self.config.mode,
+            session=(
+                f"{self.session.name} ({self.session.session_id})"
+                if self.session is not None
+                else None
+            ),
+        )
 
         try:
             while self.running:
@@ -219,6 +255,7 @@ class InteractiveRepl:
         return 0
 
     def close(self) -> None:
+        self._persist_session_settings()
         self.checkpoints.cleanup()
         if self.terminal_input is not None:
             self.terminal_input.close()
@@ -252,11 +289,18 @@ class InteractiveRepl:
             "/help": self._command_help,
             "/status": self._command_status,
             "/history": self._command_history,
+            "/sessions": self._command_sessions,
+            "/resume": self._command_resume,
+            "/rename": self._command_rename,
+            "/compact": self._command_compact,
+            "/context": self._command_context,
+            "/config": self._command_config,
             "/mode": self._command_mode,
             "/chat": self._command_chat,
             "/agent": self._command_agent,
             "/model": self._command_model,
             "/verify": self._command_verify,
+            "/changes": self._command_changes,
             "/diff": self._command_diff,
             "/undo": self._command_undo,
             "/new": self._command_new,
@@ -281,21 +325,33 @@ class InteractiveRepl:
             if self.config.verify_command
             else "未设置"
         )
-        self.writer(f"工作目录：{self.config.workspace}")
-        self.writer(f"模型：{self.config.model}")
-        self.writer(f"输入模式：{self.config.mode}")
-        self.writer(f"自动验收：{verify}")
-        self.writer(
-            "会话轮数："
-            f"{sum(1 for item in self.history if item['role'] == 'user')}"
-        )
-        self.writer(f"对话上下文字符数：{self._history_chars()}")
-        if self.last_report is not None:
-            self.writer(
-                "最近运行："
-                f"{self.last_report.status}，"
-                f"{self.last_report.elapsed_seconds:.3f} 秒"
+        rows: list[tuple[str, object]] = [
+            ("工作区", self.config.workspace),
+            ("模型", self.config.model),
+            ("模式", self.config.mode),
+            ("输出", self.config.verbosity),
+            ("自动验收", verify),
+            (
+                "会话轮数",
+                sum(1 for item in self.history if item["role"] == "user"),
+            ),
+            ("上下文", f"{self._history_chars()} 字符"),
+            ("摘要", f"{len(self.conversation_summary)} 字符"),
+        ]
+        if self.session is not None:
+            rows.insert(
+                4,
+                ("会话", f"{self.session.name} ({self.session.session_id})"),
             )
+        if self.last_report is not None:
+            rows.append(
+                (
+                    "最近运行",
+                    f"{self.last_report.status} · "
+                    f"{self.last_report.elapsed_seconds:.2f}s",
+                )
+            )
+        self.ui.key_values("当前状态", rows)
 
     def _command_history(self, _: str) -> None:
         user_messages = [
@@ -308,6 +364,89 @@ class InteractiveRepl:
             mode = item.get("mode", "agent")
             self.writer(f"{index}. [{mode}] {item['content']}")
 
+    def _command_sessions(self, _: str) -> None:
+        if self.session_store is None:
+            self.writer("当前已关闭会话持久化。")
+            return
+        sessions = self.session_store.list()
+        if not sessions:
+            self.writer("没有已保存会话。")
+            return
+        for item in sessions:
+            marker = "*" if self.session and item.session_id == self.session.session_id else " "
+            self.writer(
+                f"{marker} {item.session_id}  {item.name}  "
+                f"[{item.mode}]  {item.workspace}"
+            )
+
+    def _command_resume(self, argument: str) -> None:
+        if self.session_store is None:
+            self.writer("当前已关闭会话持久化。")
+            return
+        if not argument:
+            self.writer("用法：/resume SESSION_ID")
+            return
+        try:
+            self._switch_session(argument)
+        except SessionError as error:
+            self.writer(f"恢复会话失败：{error}")
+            return
+        self.writer(
+            f"已恢复会话：{self.session.name} ({self.session.session_id})"
+        )
+
+    def _command_rename(self, argument: str) -> None:
+        if self.session_store is None or self.session is None:
+            self.writer("当前已关闭会话持久化。")
+            return
+        if not argument:
+            self.writer("会话名称不能为空。")
+            return
+        try:
+            self.session = self.session_store.update(
+                self.session,
+                name=argument,
+            )
+        except (OSError, SessionError) as error:
+            self.writer(f"重命名会话失败：{error}")
+            return
+        self.writer(f"会话已重命名：{argument}")
+
+    def _command_compact(self, _: str) -> None:
+        window = build_conversation_window(
+            self.history,
+            max_chars=self.config.conversation_chars,
+            summary=self.conversation_summary,
+            summarized_message_count=self.summarized_message_count,
+            force=True,
+        )
+        self._save_compaction(window.summary, window.summarized_message_count)
+        self.writer(
+            "上下文已压缩："
+            f"摘要 {len(window.summary)} 字符，"
+            f"保留 {len(window.messages)} 条上下文消息。"
+        )
+
+    def _command_context(self, _: str) -> None:
+        window = self._conversation_window()
+        self.writer(f"上下文预算：{self.config.conversation_chars}")
+        self.writer(f"历史消息：{len(self.history)}")
+        self.writer(f"已摘要消息：{window.summarized_message_count}")
+        self.writer(f"摘要字符数：{len(window.summary)}")
+        self.writer(f"本轮上下文字符数：{window.context_chars}")
+
+    def _command_config(self, _: str) -> None:
+        if self.config.app_config is None:
+            self.writer("当前没有加载 TOML 配置。")
+            return
+        self.writer(
+            json.dumps(
+                self.config.app_config.to_dict(),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
     def _command_mode(self, argument: str) -> None:
         if not argument:
             self.writer(f"当前输入模式：{self.config.mode}")
@@ -317,11 +456,13 @@ class InteractiveRepl:
             self.writer("模式必须是 auto、chat 或 agent。")
             return
         self.config.mode = mode
+        self._persist_session_settings()
         self.writer(f"已切换输入模式：{mode}")
 
     def _command_chat(self, argument: str) -> None:
         if not argument:
             self.config.mode = "chat"
+            self._persist_session_settings()
             self.writer("已切换输入模式：chat")
             return
         self._run_chat(argument)
@@ -329,6 +470,7 @@ class InteractiveRepl:
     def _command_agent(self, argument: str) -> None:
         if not argument:
             self.config.mode = "agent"
+            self._persist_session_settings()
             self.writer("已切换输入模式：agent")
             return
         self._run_agent_task(argument)
@@ -338,6 +480,7 @@ class InteractiveRepl:
             self.writer(f"当前模型：{self.config.model}")
             return
         self.config.model = argument
+        self._persist_session_settings()
         self.writer(f"已切换模型：{argument}")
 
     def _command_verify(self, argument: str) -> None:
@@ -370,15 +513,33 @@ class InteractiveRepl:
             return
         self.writer(f"已设置自动验收：{shlex.join(parsed)}")
 
-    def _command_diff(self, _: str) -> None:
+    def _command_changes(self, _: str) -> None:
+        if self.last_report is None:
+            self.writer("还没有 Agent 任务记录。")
+            return
+        self.ui.title("最近修改", icon="Δ")
+        self.ui.render_changes(self.last_report.change_details)
+
+    def _command_diff(self, argument: str) -> None:
         try:
             executor = ToolExecutor(
                 root=self.config.workspace,
                 confirm=lambda _: False,
             )
-            self.writer(executor.git_diff())
+            path = self._resolve_change_argument(argument)
+            self.ui.diff(executor.git_diff(path), path=path)
         except (OSError, ToolError, ValueError) as error:
             self.writer(f"读取 diff 失败：{error}")
+
+    def _resolve_change_argument(self, argument: str) -> str | None:
+        if not argument:
+            return None
+        if argument.isdigit() and self.last_report is not None:
+            index = int(argument) - 1
+            if index < 0 or index >= len(self.last_report.changed_files):
+                raise ValueError("变更序号超出范围")
+            return self.last_report.changed_files[index]
+        return argument
 
     def _command_undo(self, _: str) -> None:
         if not self.turns:
@@ -393,19 +554,41 @@ class InteractiveRepl:
             return
         self.checkpoints.discard(turn.checkpoint_id)
         removed = {id(item) for item in turn.history_messages}
+        removed_ids = [
+            item.get("message_id", "")
+            for item in turn.history_messages
+            if item.get("message_id")
+        ]
         self.history[:] = [
             item for item in self.history if id(item) not in removed
         ]
+        if self.session_store is not None and self.session is not None:
+            self.session_store.remove_messages(
+                self.session.session_id,
+                removed_ids,
+            )
+            self._save_compaction("", 0)
         self.last_report = self.turns[-1].report if self.turns else None
         self.writer(f"已撤销：{turn.task}")
 
-    def _command_new(self, _: str) -> None:
+    def _command_new(self, argument: str) -> None:
         self.checkpoints.cleanup()
         self.checkpoints = CheckpointManager(self.config.workspace)
         self.history.clear()
         self.turns.clear()
         self.last_report = None
-        self.writer("已开始新会话，工作区文件保持当前状态。")
+        self.conversation_summary = ""
+        self.summarized_message_count = 0
+        if self.session_store is not None:
+            self._create_session(name=argument or None)
+        self.writer(
+            "已开始新会话，工作区文件保持当前状态。"
+            + (
+                f" 会话 ID：{self.session.session_id}"
+                if self.session is not None
+                else ""
+            )
+        )
 
     def _command_clear(self, _: str) -> None:
         if sys.stdout.isatty():
@@ -477,6 +660,7 @@ class InteractiveRepl:
         checkpoint = self.checkpoints.create(f"repl:{len(self.turns) + 1}")
         report_path, trace_path = self._run_paths()
         args = self._build_agent_args(scope, report_path, trace_path)
+        self.ui.task_started(scope.task, scope.workspace)
 
         try:
             report = self.agent_runner(
@@ -496,6 +680,14 @@ class InteractiveRepl:
 
         self.last_report = report
         report.write_json(report_path)
+        if self.session_store is not None and self.session is not None:
+            try:
+                self.session_store.append_run(
+                    self.session.session_id,
+                    report.to_dict(),
+                )
+            except (OSError, SessionError) as error:
+                self._disable_session_persistence(error)
 
         if report.status in {"success", "completed"}:
             answer = report.final_answer or "任务已完成。"
@@ -515,12 +707,7 @@ class InteractiveRepl:
                 self.writer(f"失败任务的工作区恢复失败：{error}")
             self.checkpoints.discard(checkpoint.checkpoint_id)
 
-        self.writer(
-            f"运行结束：{report.status} | "
-            f"{report.rounds} 轮 | {report.tool_calls} 次工具调用 | "
-            f"{report.elapsed_seconds:.3f} 秒"
-        )
-        self.writer(f"报告：{report_path}")
+        self.ui.run_report(report, report_path=report_path)
 
     def _build_agent_args(
         self,
@@ -553,6 +740,9 @@ class InteractiveRepl:
             report=report_path,
             trace=trace_path,
             show_diff=False,
+            verbosity=self.config.verbosity,
+            output_writer=self.writer,
+            embedded=True,
         )
 
     def _run_paths(self) -> tuple[Path, Path]:
@@ -573,36 +763,140 @@ class InteractiveRepl:
         assistant_content: str,
         mode: str,
     ) -> tuple[dict[str, str], dict[str, str]]:
-        user_message = {
-            "role": "user",
-            "content": user_content,
-            "mode": mode,
-        }
-        assistant_message = {
-            "role": "assistant",
-            "content": assistant_content[:4_000],
-            "mode": mode,
-        }
+        if self.session_store is not None and self.session is not None:
+            try:
+                user_message = self.session_store.append_message(
+                    self.session.session_id,
+                    role="user",
+                    content=user_content,
+                    mode=mode,
+                )
+                assistant_message = self.session_store.append_message(
+                    self.session.session_id,
+                    role="assistant",
+                    content=assistant_content[:4_000],
+                    mode=mode,
+                )
+                self.session = self.session_store.load(
+                    self.session.session_id
+                )
+            except (OSError, SessionError) as error:
+                self._disable_session_persistence(error)
+                user_message = {}
+                assistant_message = {}
+        else:
+            user_message = {}
+            assistant_message = {}
+
+        if not user_message or not assistant_message:
+            user_message = {
+                "message_id": uuid.uuid4().hex,
+                "role": "user",
+                "content": user_content,
+                "mode": mode,
+            }
+            assistant_message = {
+                "message_id": uuid.uuid4().hex,
+                "role": "assistant",
+                "content": assistant_content[:4_000],
+                "mode": mode,
+            }
         self.history.extend([user_message, assistant_message])
+        self._auto_compact()
         return user_message, assistant_message
 
     def _bounded_history(self) -> list[dict[str, str]]:
-        selected: list[dict[str, str]] = []
-        used = 0
+        return self._conversation_window().messages
 
-        for message in reversed(self.history):
-            content = message["content"]
-            if used + len(content) > self.config.conversation_chars:
-                break
-            selected.append(
-                {
-                    "role": message["role"],
-                    "content": content,
-                }
+    def _conversation_window(self):
+        window = build_conversation_window(
+            self.history,
+            max_chars=self.config.conversation_chars,
+            summary=self.conversation_summary,
+            summarized_message_count=self.summarized_message_count,
+        )
+        if (
+            window.summary != self.conversation_summary
+            or window.summarized_message_count
+            != self.summarized_message_count
+        ):
+            self._save_compaction(
+                window.summary,
+                window.summarized_message_count,
             )
-            used += len(content)
+        return window
 
-        selected.reverse()
-        if selected and selected[0]["role"] == "assistant":
-            selected.pop(0)
-        return selected
+    def _auto_compact(self) -> None:
+        if self._history_chars() + len(self.conversation_summary) <= (
+            self.config.conversation_chars
+        ):
+            return
+        self._conversation_window()
+
+    def _save_compaction(self, summary: str, count: int) -> None:
+        self.conversation_summary = summary
+        self.summarized_message_count = count
+        if self.session_store is not None and self.session is not None:
+            try:
+                self.session = self.session_store.update(
+                    self.session,
+                    summary=summary,
+                    summarized_message_count=count,
+                )
+            except (OSError, SessionError) as error:
+                self._disable_session_persistence(error)
+
+    def _create_session(self, name: str | None = None) -> None:
+        if self.session_store is None:
+            return
+        self.session = self.session_store.create(
+            workspace=self.config.workspace,
+            model=self.config.model,
+            mode=self.config.mode,
+            name=name,
+        )
+        self.config.session_id = self.session.session_id
+
+    def _load_session(self, session_id: str) -> None:
+        if self.session_store is None:
+            raise SessionError("未配置会话存储")
+        metadata = self.session_store.load(session_id)
+        workspace = Path(metadata.workspace).expanduser().resolve()
+        if not workspace.is_dir():
+            raise SessionError(f"会话工作目录不存在：{workspace}")
+        self.session = metadata
+        self.config.session_id = metadata.session_id
+        self.config.workspace = workspace
+        self.config.model = metadata.model
+        self.config.mode = metadata.mode
+        self.history = self.session_store.load_messages(session_id)
+        self.conversation_summary = metadata.summary
+        self.summarized_message_count = metadata.summarized_message_count
+
+    def _switch_session(self, session_id: str) -> None:
+        self._persist_session_settings()
+        self.checkpoints.cleanup()
+        self._load_session(session_id)
+        self.checkpoints = CheckpointManager(self.config.workspace)
+        self.turns.clear()
+        self.last_report = None
+
+    def _persist_session_settings(self) -> None:
+        if self.session_store is None or self.session is None:
+            return
+        try:
+            self.session = self.session_store.update(
+                self.session,
+                workspace=str(self.config.workspace),
+                model=self.config.model,
+                mode=self.config.mode,
+                summary=self.conversation_summary,
+                summarized_message_count=self.summarized_message_count,
+            )
+        except (OSError, SessionError) as error:
+            self._disable_session_persistence(error)
+
+    def _disable_session_persistence(self, error: Exception) -> None:
+        self.writer(f"会话保存失败，已改为仅保存在内存中：{error}")
+        self.session_store = None
+        self.session = None

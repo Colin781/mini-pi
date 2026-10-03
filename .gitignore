@@ -4,7 +4,8 @@
 
 .venv/
 .idea/
-.mini-pi/
+.mini-pi/*
+!.mini-pi/config.toml
 __pycache__/
 *.py[cod]
 *.egg-info/

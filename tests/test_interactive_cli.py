@@ -27,6 +27,11 @@ class InteractiveCliTest(unittest.TestCase):
         args = parser.parse_args(["--mode", "chat"])
         self.assertEqual(args.mode, "chat")
 
+    def test_resume_and_continue_are_mutually_exclusive(self) -> None:
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--resume", "abc", "--continue"])
+
     def test_conversation_budget_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):

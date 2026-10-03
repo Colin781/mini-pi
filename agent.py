@@ -6,7 +6,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 from openai import APIConnectionError, APIStatusError, OpenAI
@@ -14,8 +14,10 @@ from dotenv import load_dotenv
 
 from mini_pi.context import ContextLimits, ContextManager
 from mini_pi.checkpoints import CheckpointManager
+from mini_pi.events import EventTraceProxy, NullEventSink
 from mini_pi.protection import DEFAULT_PROTECTED_PATHS
 from mini_pi.reporting import AgentRunReport
+from mini_pi.terminal_ui import TerminalUI
 from mini_pi.tool_definitions import TOOL_DEFINITIONS
 from mini_pi.tools import ToolError, ToolExecutor
 from mini_pi.tracing import JsonlTraceWriter, NullTraceWriter
@@ -101,14 +103,19 @@ def serialize_assistant_message(message: Any) -> dict[str, Any]:
     return result
 
 
-def print_tool_result(result: str, preview_length: int = 1000) -> None:
+def print_tool_result(
+    result: str,
+    preview_length: int = 1000,
+    *,
+    writer: Callable[[str], None] = print,
+) -> None:
     """只在终端展示工具结果的一部分，避免输出过长。"""
     if len(result) <= preview_length:
-        print(result)
+        writer(result)
         return
 
-    print(result[:preview_length])
-    print(f"... 终端预览已截断，完整结果长度为{len(result)}个字符")
+    writer(result[:preview_length])
+    writer(f"... 终端预览已截断，完整结果长度为{len(result)}个字符")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -223,6 +230,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="将完整运行轨迹写入 JSONL 文件",
     )
 
+    parser.add_argument(
+        "--verbosity",
+        choices=("quiet", "normal", "verbose"),
+        default="normal",
+        help="终端输出详细程度",
+    )
+
     return parser
 
 def create_report(
@@ -248,12 +262,13 @@ def create_report(
     error: str | None = None,
     verification: VerificationResult | None = None,
     changed: list[str] | None = None,
+    change_details: list[dict[str, Any]] | None = None,
     protected_violations: list[str] | None = None,
     invalid_changes: list[str] | None = None,
     events: list[dict[str, Any]] | None = None,
 ) -> AgentRunReport:
     return AgentRunReport(
-        schema_version=4,
+        schema_version=5,
         status=status,
         exit_code=exit_code,
         task=args.task,
@@ -283,6 +298,7 @@ def create_report(
             else None
         ),
         changed_files=changed or [],
+        change_details=change_details or [],
         protected_violations=(
             protected_violations or []
         ),
@@ -321,6 +337,19 @@ def run_agent(
     conversation_history: list[dict[str, str]] | None = None,
 ) -> AgentRunReport:
     root = args.workspace.resolve()
+    verbosity = getattr(args, "verbosity", "normal")
+    verbosity_levels = {"quiet": 0, "normal": 1, "verbose": 2}
+    if verbosity not in verbosity_levels:
+        verbosity = "normal"
+
+    output_writer = getattr(args, "output_writer", print)
+    ui = TerminalUI(output_writer)
+    embedded = bool(getattr(args, "embedded", False))
+
+    def terminal(message: str, *, level: str = "normal") -> None:
+        required = {"always": 0, "normal": 1, "verbose": 2}[level]
+        if verbosity_levels[verbosity] >= required:
+            output_writer(message)
 
     started_at = datetime.now(
         timezone.utc
@@ -346,6 +375,11 @@ def run_agent(
                 tool_calls=0,
                 error=f"无法创建 JSONL 轨迹：{error}",
             )
+
+    trace = EventTraceProxy(
+        trace,
+        getattr(args, "event_sink", None) or NullEventSink(),
+    )
 
     trace.write(
         "run_started",
@@ -475,9 +509,7 @@ def run_agent(
         )
 
         if args.yes:
-            print(
-                f"\n自动批准：{description}"
-            )
+            terminal(f"\n自动批准：{description}", level="verbose")
             trace.write(
                 "approval_resolved",
                 description=description,
@@ -486,9 +518,7 @@ def run_agent(
             )
             return True
 
-        print(
-            f"\n请求执行：{description}"
-        )
+        terminal(f"\n请求执行：{description}", level="always")
 
         approved = (
             input(
@@ -518,9 +548,10 @@ def run_agent(
         )
 
         if args.yes:
-            print(
+            terminal(
                 "\n自动运行模式拒绝需要人工确认的操作："
-                f"{description}"
+                f"{description}",
+                level="always",
             )
             trace.write(
                 "approval_resolved",
@@ -531,7 +562,7 @@ def run_agent(
             )
             return False
 
-        print(f"\n高风险操作：{description}")
+        terminal(f"\n高风险操作：{description}", level="always")
         approved = (
             input("是否允许？输入 y 确认：")
             .strip()
@@ -625,15 +656,13 @@ def run_agent(
         VerificationResult | None
     ) = None
 
-    print(f"工作目录：{root}")
-    print(f"模型：{args.model}")
-    print(f"任务：{args.task}")
-
-    if args.verify_command:
-        print(
-            "自动验收："
-            f"{display_command(args.verify_command)}"
-        )
+    if not embedded and verbosity_levels[verbosity] >= 1:
+        ui.task_started(args.task, root)
+        if args.verify_command:
+            terminal(
+                "  验收    "
+                f"{display_command(args.verify_command)}"
+            )
 
     def workspace_result(
     ) -> tuple[
@@ -721,6 +750,11 @@ def run_agent(
             error=error,
             verification=last_verification,
             changed=changes,
+            change_details=executor.change_tracker.summarize(
+                changes,
+                root=root,
+                before_paths=set(baseline),
+            ),
             protected_violations=protected,
             invalid_changes=invalid,
             events=events,
@@ -747,9 +781,7 @@ def run_agent(
     ):
         rounds = step
 
-        print(
-            f"\n========== 第 {step} 轮 =========="
-        )
+        terminal(f"\n  第 {step} 轮", level="verbose")
 
         model_started = time.monotonic()
         trace.write(
@@ -869,9 +901,8 @@ def run_agent(
                     call.function.name
                 )
 
-                print(
-                    f"\n调用工具：{tool_name}"
-                )
+                if verbosity_levels[verbosity] >= 1:
+                    ui.tool_started(tool_name)
 
                 tool_started = time.monotonic()
                 trace.write(
@@ -964,7 +995,10 @@ def run_agent(
                     result=result,
                 )
 
-                print_tool_result(result)
+                print_tool_result(
+                    result,
+                    writer=lambda value: terminal(value, level="verbose"),
+                )
 
                 messages.append(
                     {
@@ -980,11 +1014,6 @@ def run_agent(
             message.content
             or "模型没有返回文字"
         )
-
-        print(
-            "\n========== Agent 回答 =========="
-        )
-        print(final_answer)
 
         (
             changes,
@@ -1031,11 +1060,10 @@ def run_agent(
             )
 
         if not args.verify_command:
-            if getattr(args, "show_diff", True):
-                print(
-                    "\n========== 工作区状态 =========="
-                )
-                print(executor.git_diff())
+            if not embedded:
+                ui.answer(final_answer)
+            if getattr(args, "show_diff", False):
+                ui.diff(executor.git_diff())
 
             return finish(
                 status="completed",
@@ -1047,6 +1075,8 @@ def run_agent(
             round=step,
             command=list(args.verify_command),
         )
+        if embedded and verbosity_levels[verbosity] >= 1:
+            ui.tool_started("verification")
 
         last_verification = (
             run_verification(
@@ -1098,25 +1128,22 @@ def run_agent(
             output=last_verification.output,
         )
 
-        print(
-            "\n========== 自动验收 =========="
-        )
-
-        print(
-            "退出码："
-            f"{last_verification.exit_code}"
-        )
-
-        print_tool_result(
-            last_verification.output
-        )
+        if not embedded:
+            ui.verification(
+                passed=last_verification.passed,
+                elapsed_seconds=last_verification.elapsed_seconds,
+                output=last_verification.output,
+                show_output=(
+                    verbosity == "verbose" or not last_verification.passed
+                ),
+                full_output=verbosity == "verbose",
+            )
 
         if last_verification.passed:
-            if getattr(args, "show_diff", True):
-                print(
-                    "\n========== 工作区状态 =========="
-                )
-                print(executor.git_diff())
+            if not embedded:
+                ui.answer(final_answer)
+            if getattr(args, "show_diff", False):
+                ui.diff(executor.git_diff())
 
             return finish(
                 status="success",
@@ -1308,45 +1335,14 @@ def main() -> int:
 
     report = run_agent(args)
 
-    if report.error:
-        print(
-            f"\n错误：{report.error}"
-        )
-
-    print(
-        "\n========== 运行统计 =========="
-    )
-    print(f"状态：{report.status}")
-    print(f"Agent 轮数：{report.rounds}")
-    print(
-        f"修复次数："
-        f"{report.repair_attempts}"
-    )
-    print(
-        f"工具调用次数："
-        f"{report.tool_calls}"
-    )
-    print(f"读取文件次数：{report.files_read}")
-    print(f"读取文件数：{report.unique_files_read}")
-    print(f"上下文字符数：{report.context_chars}")
-    print(f"搜索调用次数：{report.search_calls}")
-    print(f"应用补丁次数：{report.patches_applied}")
-    print(f"创建检查点次数：{report.checkpoints_created}")
-    print(f"恢复检查点次数：{report.checkpoints_restored}")
-    if report.trace_path:
-        print(f"运行轨迹：{report.trace_path}")
-    print(
-        f"运行耗时："
-        f"{report.elapsed_seconds:.3f} 秒"
-    )
-
     if args.report:
         report.write_json(args.report)
 
-        print(
-            "报告已写入："
-            f"{args.report.resolve()}"
-        )
+    TerminalUI().run_report(
+        report,
+        report_path=args.report.resolve() if args.report else None,
+        include_answer=False,
+    )
 
     return report.exit_code
 

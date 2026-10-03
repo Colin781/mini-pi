@@ -41,6 +41,14 @@ Mini Pi 是一个用于学习 Coding Agent 工作原理的 Python 项目。
 - 持续对话的交互式 REPL
 - 会话内上下文复用、任务历史和一键撤销
 - 普通对话与代码任务自动分流
+- 跨进程保存、列出和恢复 REPL 会话
+- 长会话自动摘要与上下文压缩
+- 用户级和项目级 TOML 配置
+- quiet、normal、verbose 三级输出
+- 统一 Agent 事件总线
+- 统一的终端标题、状态和结果布局
+- 按文件及行号展示修改位置
+- `/changes` 变更摘要与按文件查看 diff
 - 可安装的 `mini-pi` 全局命令
 
 ## 安装
@@ -125,23 +133,112 @@ mini-pi> file:/path/repository/packages/calculator/tests/test_calculator.py，�
 - `/model deepseek-chat`：在当前会话切换模型
 - `/verify python -m unittest discover -s tests -v`：设置自动验收
 - `/history`：显示本次会话已完成的任务
-- `/diff`：显示当前 Git diff
+- `/sessions`：列出已经保存的会话
+- `/resume ID`：在 REPL 中切换到指定会话
+- `/rename 名称`：重命名当前会话
+- `/compact`：立即压缩早期对话
+- `/context`：显示上下文预算、摘要和消息数量
+- `/config`：显示合并后的有效配置
+- `/changes`：显示最近任务修改的文件、行号和增删行数
+- `/diff`：显示当前完整 Git diff
+- `/diff 文件路径`：只显示指定文件的 Git diff
+- `/diff 2`：按 `/changes` 中的序号显示第二个修改文件
 - `/undo`：撤销上一个成功任务的文件修改和对话记录
 - `/new`：清空对话记录并从当前工作区开始新会话
 - `/trace`：显示最近一次 JSONL 轨迹路径
 - `/exit`：退出
 
 完整 Git diff 只在执行 `/diff` 时显示，Agent 任务完成后只输出回答和简短运行统计。
+任务结果会直接列出 `文件路径:起始行号`，多数终端和 IDE 可以直接点击定位。
+设置标准的 `NO_COLOR=1` 环境变量可以关闭 TTY 颜色。
 
 输入内容以反斜杠结尾时，可以继续输入下一行。终端输入历史默认保存在
 `~/.mini-pi/history`，每次任务的 JSON 报告和 JSONL 轨迹保存在当前工作区的
 `.mini-pi/runs/`。该目录已被 Git 忽略。
+
+## 持久化会话
+
+v0.8 默认将会话保存在 `~/.mini-pi/sessions/`。重新进入项目后可以恢复
+最近使用的会话：
+
+```bash
+mini-pi --continue
+```
+
+也可以指定会话 ID：
+
+```bash
+mini-pi --resume 817158b758a5
+```
+
+不希望保存当前运行时，可以使用：
+
+```bash
+mini-pi --no-session
+```
+
+每个会话保存工作区、模型、输入模式、对话消息、摘要和运行报告索引。
+会话采用 JSONL 追加写入；最后一行因进程中断而损坏时，之前的消息仍可恢复。
+API Key、token 和密码形式的内容在写入前会被隐藏。
+
+长对话超过 `conversation_chars` 后会自动把较早消息压缩成摘要，并保留最近
+消息。使用 `/compact` 可以手动压缩，使用 `/context` 可以查看本轮实际发送给
+模型的上下文大小。
+
+## 配置文件
+
+配置读取优先级为：CLI 参数、项目配置、用户配置、环境变量、程序默认值。
+
+- 用户配置：`~/.config/mini-pi/config.toml`
+- 项目配置：`项目目录/.mini-pi/config.toml`
+- 完整示例：[config.example.toml](config.example.toml)
+
+```toml
+[model]
+name = "deepseek-flash"
+
+[agent]
+max_steps = 20
+max_context_chars = 30000
+
+[repl]
+mode = "auto"
+verbosity = "normal"
+conversation_chars = 12000
+persist_sessions = true
+```
+
+输出级别也可以临时指定：
+
+```bash
+mini-pi --verbosity quiet
+mini-pi --verbosity verbose
+```
 
 不进入 REPL 时仍可执行单次任务：
 
 ```bash
 mini-pi --workspace . "修复订单总额计算并运行测试"
 ```
+
+## v0.9 终端界面与变更审阅
+
+v0.9 把任务、工具进度、回答、验收和最终状态放在固定区域中。普通输出只显示
+工具名称和失败诊断摘要，`--verbosity verbose` 才会展开完整工具及测试输出。
+
+任务结束后的修改摘要示例：
+
+```text
+✓ 完成
+  修改  2 个文件
+    1. M mini_pi/repl.py:621  L621-684 · +42 -8
+    2. A mini_pi/terminal_ui.py:1  L1-206 · +206
+  ✓ 验收 通过 · 0.38s
+  5 轮 · 8 次工具调用 · 6.21s
+```
+
+运行 `/changes` 可以重新查看这份索引，随后使用 `/diff 1` 或
+`/diff mini_pi/repl.py` 只展开一个文件。完整报告仍保存在 `.mini-pi/runs/`。
 
 ## 可复现评测
 

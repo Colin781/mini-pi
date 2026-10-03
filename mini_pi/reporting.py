@@ -29,6 +29,7 @@ class AgentRunReport:
     error: str | None = None
     verification: dict[str, Any] | None = None
     changed_files: list[str] = field(default_factory=list)
+    change_details: list[dict[str, Any]] = field(default_factory=list)
     protected_violations: list[str] = field(default_factory=list)
     disallowed_changes: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)

@@ -22,18 +22,18 @@ SECRET_PATTERN = re.compile(
 )
 
 
-def _redact(value: Any, key: str = "") -> Any:
+def redact(value: Any, key: str = "") -> Any:
     normalized_key = key.casefold()
     if any(part in normalized_key for part in SENSITIVE_KEY_PARTS):
         return "***"
 
     if isinstance(value, dict):
         return {
-            str(item_key): _redact(item_value, str(item_key))
+            str(item_key): redact(item_value, str(item_key))
             for item_key, item_value in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_redact(item) for item in value]
+        return [redact(item) for item in value]
     if isinstance(value, str):
         return SECRET_PATTERN.sub("***", value)
     return value
@@ -64,7 +64,7 @@ class JsonlTraceWriter:
                 "event_id": self.event_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "type": event_type,
-                **_redact(payload),
+                **redact(payload),
             }
 
             with self.path.open("a", encoding="utf-8") as stream:

@@ -5,6 +5,7 @@ from pathlib import Path
 from mini_pi.chat import ChatResult
 from mini_pi.repl import InteractiveRepl, ReplConfig, classify_input
 from mini_pi.reporting import AgentRunReport
+from mini_pi.sessions import SessionStore
 
 
 def make_report(
@@ -29,6 +30,33 @@ def make_report(
 
 
 class ReplTest(unittest.TestCase):
+    def test_session_is_persisted_and_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root / "sessions")
+            first = InteractiveRepl(
+                ReplConfig(workspace=root, session_store=store),
+                reader=lambda _: "",
+                writer=lambda _: None,
+            )
+            first.handle_line("你好，你是什么模型")
+            session_id = first.session.session_id
+            first.close()
+
+            second = InteractiveRepl(
+                ReplConfig(
+                    workspace=root,
+                    session_store=store,
+                    session_id=session_id,
+                ),
+                reader=lambda _: "",
+                writer=lambda _: None,
+            )
+            self.assertEqual(len(second.history), 2)
+            self.assertEqual(second.history[0]["role"], "user")
+            self.assertIn("什么模型", second.history[0]["content"])
+            second.close()
+
     def test_auto_mode_routes_chat_without_running_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output: list[str] = []
@@ -235,6 +263,26 @@ class ReplTest(unittest.TestCase):
                 repl._read_task(),
                 "修复这个问题\n并运行测试",
             )
+            repl.close()
+
+    def test_diff_number_selects_changed_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repl = InteractiveRepl(
+                ReplConfig(workspace=root),
+                reader=lambda _: "",
+                writer=lambda _: None,
+            )
+            report = make_report(root, "修改两个文件")
+            report.changed_files = ["first.py", "second.py"]
+            repl.last_report = report
+
+            self.assertEqual(
+                repl._resolve_change_argument("2"),
+                "second.py",
+            )
+            with self.assertRaises(ValueError):
+                repl._resolve_change_argument("3")
             repl.close()
 
     def test_failed_task_restores_workspace(self) -> None:

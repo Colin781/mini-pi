@@ -53,6 +53,15 @@ class AgentRunReportTest(
                 changed_files=[
                     "calculator.py"
                 ],
+                change_details=[
+                    {
+                        "path": "calculator.py",
+                        "status": "modified",
+                        "lines": ["2"],
+                        "added": 1,
+                        "removed": 1,
+                    }
+                ],
             )
 
             report.write_json(
@@ -94,6 +103,10 @@ class AgentRunReportTest(
             self.assertEqual(saved["patches_applied"], 2)
             self.assertEqual(saved["checkpoints_restored"], 1)
             self.assertEqual(saved["trace_path"], "/tmp/run.jsonl")
+            self.assertEqual(
+                saved["change_details"][0]["lines"],
+                ["2"],
+            )
 
             self.assertTrue(
                 saved["verification"][

@@ -109,6 +109,24 @@ class ToolExecutorTest(unittest.TestCase):
             path.read_text(encoding="utf-8"),
         )
 
+    def test_runtime_state_is_protected(self) -> None:
+        path = self.write_file(
+            ".mini-pi/config.toml",
+            'model = "deepseek-flash"\n',
+        )
+
+        with self.assertRaises(ToolError):
+            self.executor.replace_text(
+                path=".mini-pi/config.toml",
+                old="deepseek-flash",
+                new="changed-by-agent",
+            )
+
+        self.assertEqual(
+            path.read_text(encoding="utf-8"),
+            'model = "deepseek-flash"\n',
+        )
+
     def test_apply_patch_tool(self) -> None:
         path = self.write_file(
             "calculator.py",

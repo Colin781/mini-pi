@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agent import build_parser, run_agent
+from mini_pi.events import ListEventSink
 
 
 class RecordingCompletions:
@@ -68,6 +69,31 @@ class AgentConversationTest(unittest.TestCase):
             self.assertEqual(report.status, "completed")
             self.assertNotIn("工作区状态", output.getvalue())
             self.assertNotIn("Git diff", output.getvalue())
+
+    def test_run_events_and_quiet_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sample.py").write_text("value = 1\n", encoding="utf-8")
+            completions = RecordingCompletions()
+            client = SimpleNamespace(
+                chat=SimpleNamespace(completions=completions)
+            )
+            args = build_parser().parse_args(
+                ["--workspace", str(root), "解释代码"]
+            )
+            args.verbosity = "quiet"
+            args.event_sink = ListEventSink()
+
+            output = StringIO()
+            with redirect_stdout(output):
+                report = run_agent(args, client=client)
+
+            self.assertEqual(report.status, "completed")
+            self.assertNotIn("工作目录：", output.getvalue())
+            self.assertIn("完成", output.getvalue())
+            event_types = [event.type for event in args.event_sink.events]
+            self.assertEqual(event_types[0], "run_started")
+            self.assertEqual(event_types[-1], "run_finished")
 
 
 if __name__ == "__main__":

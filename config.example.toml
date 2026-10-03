@@ -1,0 +1,19 @@
+[model]
+name = "deepseek-flash"
+
+[agent]
+max_steps = 15
+max_repairs = 2
+max_context_chars = 30000
+max_file_chars = 10000
+command_timeout = 60
+
+[repl]
+mode = "auto"
+verbosity = "normal"
+conversation_chars = 12000
+persist_sessions = true
+
+[safety]
+protected_paths = []
+allowed_changes = []
